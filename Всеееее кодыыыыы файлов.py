@@ -1,7 +1,12 @@
 # код - main.py
 
+# main.py
 import asyncio
+import sys
 from pathlib import Path
+from typing import Optional, Dict, Any
+import signal
+from datetime import datetime
 
 from logs import get_logger
 from rag_chunk_tracker import ChunkUsageTracker
@@ -12,149 +17,293 @@ from rag_langchain_tools import enrich_context_with_tools
 from rag_prompt_utils import get_prompt_parts
 from image_utils import prepare_media_for_post, get_media_type
 
-# ==== КОНФИГ ====
-BASE_DIR      = Path(__file__).parent
-DATA_DIR      = BASE_DIR / "data"
-LOG_DIR       = BASE_DIR / "logs"
-INFORM_DIR    = BASE_DIR / "inform"
-INDEX_FILE    = DATA_DIR / "faiss_index.idx"
-CONTEXT_FILE  = DATA_DIR / "faiss_contexts.json"
-USAGE_STATS_FILE = DATA_DIR / "usage_statistics.json"
+class RAGException(Exception):
+    """Базовый класс для исключений RAG системы"""
+    pass
 
-CHUNK_USAGE_LIMIT = 10
-USAGE_RESET_DAYS = 7
-DIVERSITY_BOOST = 0.3
+class ConfigurationError(RAGException):
+    """Ошибки конфигурации"""
+    pass
 
-EMB_MODEL     = "all-MiniLM-L6-v2"
-CROSS_MODEL   = "cross-encoder/stsb-roberta-large"
-CHUNK_SIZE    = 500
-OVERLAP       = 100
-TOP_K_TITLE   = 2
-TOP_K_FAISS   = 8
-TOP_K_FINAL   = 3
+class InitializationError(RAGException):
+    """Ошибки инициализации компонентов"""
+    pass
 
-PROMPT1_DIR = DATA_DIR / "prompt_1"
-PROMPT2_DIR = DATA_DIR / "prompt_2"
-MAX_TELEGRAM_LENGTH = 4096
+class ProcessingError(RAGException):
+    """Ошибки обработки данных"""
+    pass
 
-# Загрузка токена и channel_id из config/
-BOT_TOKEN = (BASE_DIR / "config" / "telegram_token.txt").read_text(encoding="utf-8").strip()
-CHANNEL_ID = (BASE_DIR / "config" / "telegram_channel.txt").read_text(encoding="utf-8").strip()
+class RAGSystem:
+    def __init__(self):
+        self.base_dir = Path(__file__).parent
+        self.setup_paths()
+        self.logger = get_logger(__name__, logfile=self.log_dir / "bot.log")
+        
+        # Флаг для graceful shutdown
+        self.should_exit = False
+        signal.signal(signal.SIGINT, self.handle_shutdown)
+        signal.signal(signal.SIGTERM, self.handle_shutdown)
 
-logger = get_logger(__name__, logfile=LOG_DIR / "bot.log")
+    def setup_paths(self):
+        """Инициализация и проверка необходимых директорий"""
+        # Основные директории
+        self.data_dir = self.base_dir / "data"
+        self.log_dir = self.base_dir / "logs"
+        self.inform_dir = self.base_dir / "inform"
+        self.config_dir = self.base_dir / "config"
+        self.media_dir = self.base_dir / "media"
 
-async def main():
-    usage_tracker = ChunkUsageTracker(
-        usage_stats_file=USAGE_STATS_FILE,
-        logger=logger,
-        chunk_usage_limit=CHUNK_USAGE_LIMIT,
-        usage_reset_days=USAGE_RESET_DAYS,
-        diversity_boost=DIVERSITY_BOOST
-    )
-    usage_tracker.cleanup_old_stats()
-    retriever = HybridRetriever(
-        emb_model=EMB_MODEL,
-        cross_model=CROSS_MODEL,
-        index_file=INDEX_FILE,
-        context_file=CONTEXT_FILE,
-        inform_dir=INFORM_DIR,
-        chunk_size=CHUNK_SIZE,
-        overlap=OVERLAP,
-        top_k_title=TOP_K_TITLE,
-        top_k_faiss=TOP_K_FAISS,
-        top_k_final=TOP_K_FINAL,
-        usage_tracker=usage_tracker,
-        logger=logger
-    )
-    lm = LMClient(
-        retriever=retriever,
-        data_dir=DATA_DIR,
-        inform_dir=INFORM_DIR,
-        logger=logger
-    )
-    tg = TelegramPublisher(BOT_TOKEN, CHANNEL_ID, logger)
+        # Файлы
+        self.index_file = self.data_dir / "faiss_index.idx"
+        self.context_file = self.data_dir / "faiss_contexts.json"
+        self.usage_stats_file = self.data_dir / "usage_statistics.json"
+        self.processed_topics_file = self.data_dir / "processed_topics.txt"
 
-    prompt1_files = sorted(PROMPT1_DIR.glob("*.txt"))
-    prompt2_files = sorted(PROMPT2_DIR.glob("*.txt"))
-    if not prompt1_files or not prompt2_files:
-        logger.error("Нет файлов в prompt_1 или prompt_2")
-        return
+        # Создание директорий если не существуют
+        for directory in [self.data_dir, self.log_dir, self.inform_dir, 
+                         self.config_dir, self.media_dir]:
+            directory.mkdir(parents=True, exist_ok=True)
 
-    for file1 in prompt1_files:
-        for file2 in prompt2_files:
-            topic = file1.stem
-            context = retriever.retrieve(topic)
-            # enrich_context_with_tools — добавляет web/calc/table enrichment к context, если нужно
-            context = enrich_context_with_tools(topic, context, INFORM_DIR)
-            # get_prompt_parts — корректно собирает промт из шаблонов, учитывает uploadfile, лимиты
+    def load_config(self) -> Dict[str, Any]:
+        """Загрузка конфигурации из файлов"""
+        try:
+            # Проверяем наличие необходимых файлов
+            token_file = self.config_dir / "telegram_token.txt"
+            channel_file = self.config_dir / "telegram_channel.txt"
+
+            if not token_file.exists():
+                raise ConfigurationError("telegram_token.txt not found")
+            if not channel_file.exists():
+                raise ConfigurationError("telegram_channel.txt not found")
+
+            # Читаем конфигурацию
+            bot_token = token_file.read_text(encoding="utf-8").strip()
+            channel_id = channel_file.read_text(encoding="utf-8").strip()
+
+            if not bot_token or not channel_id:
+                raise ConfigurationError(
+                    "Telegram token or channel ID is empty")
+
+            # Возвращаем полную конфигурацию
+            return {
+                "bot_token": bot_token,
+                "channel_id": channel_id,
+                # Дефолтные значения для системы
+                "chunk_usage_limit": 10,
+                "usage_reset_days": 7,
+                "diversity_boost": 0.3,
+                "emb_model": "all-MiniLM-L6-v2",
+                "cross_model": "cross-encoder/stsb-roberta-large",
+                "chunk_size": 500,
+                "overlap": 100,
+                "top_k_title": 2,
+                "top_k_faiss": 8,
+                "top_k_final": 3
+            }
+        except Exception as e:
+            raise ConfigurationError(f"Failed to load configuration: {e}")
+
+    def load_processed_topics(self) -> set:
+        """Загрузка списка обработанных тем"""
+        try:
+            if self.processed_topics_file.exists():
+                return set(self.processed_topics_file.read_text(
+                    encoding='utf-8').splitlines())
+            return set()
+        except Exception as e:
+            self.logger.warning(f"Failed to load processed topics: {e}")
+            return set()
+
+    def save_processed_topic(self, topic: str):
+        """Сохранение обработанной темы"""
+        try:
+            with open(self.processed_topics_file, 'a', encoding='utf-8') as f:
+                f.write(f"{topic}\n")
+        except Exception as e:
+            self.logger.error(f"Failed to save processed topic: {e}")
+
+    async def notify_error(self, message: str):
+        """Отправка уведомления об ошибке в Telegram"""
+        if hasattr(self, 'telegram'):
+            try:
+                await self.telegram.send_text(
+                    f"🚨 RAG System Error:\n{message}"
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to send error notification: {e}")
+
+    def handle_shutdown(self, signum, frame):
+        """Обработчик сигналов завершения"""
+        self.logger.info("Received shutdown signal, cleaning up...")
+        self.should_exit = True
+
+    async def process_topics(self):
+        """Обработка тем из files_1 и files_2"""
+        prompt1_dir = self.data_dir / "prompt_1"
+        prompt2_dir = self.data_dir / "prompt_2"
+
+        if not prompt1_dir.exists() or not prompt2_dir.exists():
+            raise ProcessingError("Prompt directories not found")
+
+        prompt1_files = sorted(prompt1_dir.glob("*.txt"))
+        prompt2_files = sorted(prompt2_dir.glob("*.txt"))
+
+        if not prompt1_files or not prompt2_files:
+            raise ProcessingError("No prompt files found")
+
+        processed_topics = self.load_processed_topics()
+
+        for file1 in prompt1_files:
+            if self.should_exit:
+                break
+
+            for file2 in prompt2_files:
+                if self.should_exit:
+                    break
+
+                topic = f"{file1.stem}_{file2.stem}"
+                
+                if topic in processed_topics:
+                    continue
+
+                try:
+                    await self.process_single_topic(file1, file2)
+                    self.save_processed_topic(topic)
+                except Exception as e:
+                    error_msg = f"Error processing {topic}: {e}"
+                    self.logger.error(error_msg)
+                    await self.notify_error(error_msg)
+                    await asyncio.sleep(5)
+
+    async def process_single_topic(self, file1: Path, file2: Path):
+        """Обработка одной темы"""
+        topic = file1.stem
+        try:
+            # Получение контекста
+            context = self.retriever.retrieve(topic)
+            context = enrich_context_with_tools(topic, context, self.inform_dir)
+
+            # Генерация промпта
             prompt_full = get_prompt_parts(
-                data_dir=DATA_DIR,
+                data_dir=self.data_dir,
                 topic=topic,
                 context=context,
                 file1=file1,
                 file2=file2
             )
-            messages = [
-                {"role": "system", "content": "Вы — эксперт по бровям и ресницам."},
-                {"role": "user", "content": prompt_full}
-            ]
-            attempt = 0
-            max_attempts = 6
-            while attempt < max_attempts:
-                attempt += 1
-                text = await lm.generate_raw(messages)
-                if text is None:
-                    logger.error(f"LM не дал ответ для темы {topic}")
-                    break
-                if len(text) <= MAX_TELEGRAM_LENGTH:
-                    # --- Блок: обработка медиа, если шаблон подразумевает вставку файла ---
-                    if "{UPLOADFILE}" in prompt_full:
-                        media_file = prepare_media_for_post(Path("media"))
-                        if media_file:
-                            media_type = get_media_type(media_file)
-                            logger.info(f"Выбран медиа-файл для публикации: {media_file} (тип: {media_type})")
-                            try:
-                                if media_type == "image":
-                                    await tg.send_photo(media_file, caption=text)
-                                elif media_type == "document":
-                                    await tg.send_document(media_file, caption=text)
-                                elif media_type == "video":
-                                    await tg.send_video(media_file, caption=text)
-                                elif media_type == "audio":
-                                    await tg.send_audio(media_file, caption=text)
-                                else:
-                                    logger.warning(f"Неизвестный тип медиа: {media_file}, отправляем только текст.")
-                                    await tg.send_text(text)
-                                logger.info(f"Тема '{topic}': успешно отправлено с медиа в Telegram (длина {len(text)})")
-                            except Exception as e:
-                                logger.error(f"Ошибка при отправке медиа: {e}")
-                                await tg.send_text(text)
-                        else:
-                            logger.warning("Медиа-файл не найден или невалиден — отправляем только текст")
-                            await tg.send_text(text)
-                    else:
-                        await tg.send_text(text)
-                        logger.info(f"Тема '{topic}': успешно отправлено в Telegram (длина {len(text)})")
-                    break
-                else:
-                    logger.info(f"Тема '{topic}': длина {len(text)}, просим сократить")
-                    messages.append({"role": "assistant", "content": text})
-                    messages.append({
-                        "role": "user",
-                        "content": f"Текст слишком длинный ({len(text)}>4096). Сократи до 4096 символов без потери смысла."
-                    })
+
+            # Генерация текста
+            text = await self.lm.generate(topic)
+            if not text:
+                raise ProcessingError("Failed to generate text")
+
+            # Обработка медиафайла если нужно
+            if "{UPLOADFILE}" in prompt_full:
+                await self.handle_media_post(text)
             else:
-                logger.warning(f"Тема '{topic}': не удалось сократить текст до лимита за {max_attempts} попыток.")
+                await self.telegram.send_text(text)
+
+            self.logger.info(f"Successfully processed topic: {topic}")
+
+        except Exception as e:
+            raise ProcessingError(f"Failed to process topic {topic}: {e}")
+
+    async def handle_media_post(self, text: str):
+        """Обработка поста с медиафайлом"""
+        try:
+            media_file = prepare_media_for_post(self.media_dir)
+            if not media_file:
+                raise ProcessingError("No valid media file found")
+
+            media_type = get_media_type(media_file)
+            self.logger.info(f"Selected media file: {media_file} (type: {media_type})")
+
+            media_handlers = {
+                "image": self.telegram.send_photo,
+                "video": self.telegram.send_video,
+                "document": self.telegram.send_document,
+                "audio": self.telegram.send_audio
+            }
+
+            if media_type in media_handlers:
+                await media_handlers[media_type](media_file, caption=text)
+            else:
+                self.logger.warning(f"Unknown media type: {media_file}")
+                await self.telegram.send_text(text)
+
+        except Exception as e:
+            self.logger.error(f"Media handling error: {e}")
+            await self.telegram.send_text(text)
+
+    async def run(self):
+        """Основной метод запуска системы"""
+        try:
+            # Загрузка конфигурации
+            config = self.load_config()
+            
+            # Инициализация компонентов
+            self.usage_tracker = ChunkUsageTracker(
+                usage_stats_file=self.usage_stats_file,
+                logger=self.logger,
+                chunk_usage_limit=config["chunk_usage_limit"],
+                usage_reset_days=config["usage_reset_days"],
+                diversity_boost=config["diversity_boost"]
+            )
+            self.usage_tracker.cleanup_old_stats()
+
+            self.retriever = HybridRetriever(
+                emb_model=config["emb_model"],
+                cross_model=config["cross_model"],
+                index_file=self.index_file,
+                context_file=self.context_file,
+                inform_dir=self.inform_dir,
+                chunk_size=config["chunk_size"],
+                overlap=config["overlap"],
+                top_k_title=config["top_k_title"],
+                top_k_faiss=config["top_k_faiss"],
+                top_k_final=config["top_k_final"],
+                usage_tracker=self.usage_tracker,
+                logger=self.logger
+            )
+
+            self.lm = LMClient(
+                retriever=self.retriever,
+                data_dir=self.data_dir,
+                inform_dir=self.inform_dir,
+                logger=self.logger
+            )
+
+            self.telegram = TelegramPublisher(
+                config["bot_token"],
+                config["channel_id"],
+                logger=self.logger
+            )
+
+            # Основной цикл обработки
+            await self.process_topics()
+
+        except ConfigurationError as e:
+            self.logger.critical(f"Configuration error: {e}")
+            await self.notify_error(f"Configuration error: {e}")
+            sys.exit(1)
+        except Exception as e:
+            self.logger.critical(f"Unexpected error: {e}")
+            await self.notify_error(f"Unexpected error: {e}")
+            sys.exit(1)
+        finally:
+            if hasattr(self, 'usage_tracker'):
+                self.usage_tracker.save_statistics()
+            self.logger.info("System shutdown complete")
 
 if __name__ == '__main__':
+    rag_system = RAGSystem()
     try:
-        asyncio.run(main())
+        asyncio.run(rag_system.run())
     except KeyboardInterrupt:
-        logger.info("Process interrupted by user")
+        print("\nShutdown requested... exiting")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        raise
-
+        print(f"Fatal error: {e}")
+        sys.exit(1)
 
 # код - logs.py
 

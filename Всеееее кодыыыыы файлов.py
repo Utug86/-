@@ -7,8 +7,13 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import signal
 from datetime import datetime
+import logging
 
-from logs import get_logger
+from utils.config_manager import ConfigManager
+from utils.state_manager import StateManager
+from utils.file_manager import TempFileManager
+from utils.exceptions import *
+
 from rag_chunk_tracker import ChunkUsageTracker
 from rag_retriever import HybridRetriever
 from rag_telegram import TelegramPublisher
@@ -17,133 +22,150 @@ from rag_langchain_tools import enrich_context_with_tools
 from rag_prompt_utils import get_prompt_parts
 from image_utils import prepare_media_for_post, get_media_type
 
-class RAGException(Exception):
-    """Базовый класс для исключений RAG системы"""
-    pass
-
-class ConfigurationError(RAGException):
-    """Ошибки конфигурации"""
-    pass
-
-class InitializationError(RAGException):
-    """Ошибки инициализации компонентов"""
-    pass
-
-class ProcessingError(RAGException):
-    """Ошибки обработки данных"""
-    pass
-
 class RAGSystem:
     def __init__(self):
+        # Базовые пути
         self.base_dir = Path(__file__).parent
-        self.setup_paths()
-        self.logger = get_logger(__name__, logfile=self.log_dir / "bot.log")
+        
+        # Инициализация конфигурации
+        self.config = ConfigManager(self.base_dir / "config" / "config.json")
+        
+        # Настройка логирования
+        self.setup_logging()
+        
+        # Инициализация менеджеров
+        self.state_manager = StateManager(
+            self.config.get_path("processed_topics_file")
+        )
+        self.temp_manager = TempFileManager(
+            self.config.get_path("temp_dir")
+        )
         
         # Флаг для graceful shutdown
         self.should_exit = False
         signal.signal(signal.SIGINT, self.handle_shutdown)
         signal.signal(signal.SIGTERM, self.handle_shutdown)
+        
+        # Валидация структуры проекта
+        self.validate_project_structure()
 
-    def setup_paths(self):
-        """Инициализация и проверка необходимых директорий"""
-        # Основные директории
-        self.data_dir = self.base_dir / "data"
-        self.log_dir = self.base_dir / "logs"
-        self.inform_dir = self.base_dir / "inform"
-        self.config_dir = self.base_dir / "config"
-        self.media_dir = self.base_dir / "media"
+    def setup_logging(self):
+        """Настройка системы логирования"""
+        log_dir = self.config.get_path("log_dir")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.logger = logging.getLogger("rag_system")
+        self.logger.setLevel(logging.INFO)
+        
+        # Файловый handler
+        file_handler = logging.FileHandler(
+            log_dir / f"rag_{datetime.utcnow().strftime('%Y%m%d')}.log",
+            encoding='utf-8'
+        )
+        file_handler.setFormatter(
+            logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        )
+        self.logger.addHandler(file_handler)
+        
+        # Консольный handler
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(
+            logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        )
+        self.logger.addHandler(console_handler)
 
-        # Файлы
-        self.index_file = self.data_dir / "faiss_index.idx"
-        self.context_file = self.data_dir / "faiss_contexts.json"
-        self.usage_stats_file = self.data_dir / "usage_statistics.json"
-        self.processed_topics_file = self.data_dir / "processed_topics.txt"
-
-        # Создание директорий если не существуют
-        for directory in [self.data_dir, self.log_dir, self.inform_dir, 
-                         self.config_dir, self.media_dir]:
-            directory.mkdir(parents=True, exist_ok=True)
-
-    def load_config(self) -> Dict[str, Any]:
-        """Загрузка конфигурации из файлов"""
+    def validate_project_structure(self):
+        """Проверка структуры проекта"""
+        required_dirs = [
+            "data_dir",
+            "log_dir",
+            "inform_dir",
+            "media_dir"
+        ]
+        
         try:
-            # Проверяем наличие необходимых файлов
-            token_file = self.config_dir / "telegram_token.txt"
-            channel_file = self.config_dir / "telegram_channel.txt"
-
-            if not token_file.exists():
-                raise ConfigurationError("telegram_token.txt not found")
-            if not channel_file.exists():
-                raise ConfigurationError("telegram_channel.txt not found")
-
-            # Читаем конфигурацию
-            bot_token = token_file.read_text(encoding="utf-8").strip()
-            channel_id = channel_file.read_text(encoding="utf-8").strip()
-
-            if not bot_token or not channel_id:
-                raise ConfigurationError(
-                    "Telegram token or channel ID is empty")
-
-            # Возвращаем полную конфигурацию
-            return {
-                "bot_token": bot_token,
-                "channel_id": channel_id,
-                # Дефолтные значения для системы
-                "chunk_usage_limit": 10,
-                "usage_reset_days": 7,
-                "diversity_boost": 0.3,
-                "emb_model": "all-MiniLM-L6-v2",
-                "cross_model": "cross-encoder/stsb-roberta-large",
-                "chunk_size": 500,
-                "overlap": 100,
-                "top_k_title": 2,
-                "top_k_faiss": 8,
-                "top_k_final": 3
-            }
+            for dir_key in required_dirs:
+                dir_path = self.config.get_path(dir_key)
+                dir_path.mkdir(parents=True, exist_ok=True)
+                
+                if dir_key == "data_dir":
+                    (dir_path / "prompt_1").mkdir(exist_ok=True)
+                    (dir_path / "prompt_2").mkdir(exist_ok=True)
+            
+            self.logger.info("Project structure validated successfully")
         except Exception as e:
-            raise ConfigurationError(f"Failed to load configuration: {e}")
-
-    def load_processed_topics(self) -> set:
-        """Загрузка списка обработанных тем"""
-        try:
-            if self.processed_topics_file.exists():
-                return set(self.processed_topics_file.read_text(
-                    encoding='utf-8').splitlines())
-            return set()
-        except Exception as e:
-            self.logger.warning(f"Failed to load processed topics: {e}")
-            return set()
-
-    def save_processed_topic(self, topic: str):
-        """Сохранение обработанной темы"""
-        try:
-            with open(self.processed_topics_file, 'a', encoding='utf-8') as f:
-                f.write(f"{topic}\n")
-        except Exception as e:
-            self.logger.error(f"Failed to save processed topic: {e}")
-
-    async def notify_error(self, message: str):
-        """Отправка уведомления об ошибке в Telegram"""
-        if hasattr(self, 'telegram'):
-            try:
-                await self.telegram.send_text(
-                    f"🚨 RAG System Error:\n{message}"
-                )
-            except Exception as e:
-                self.logger.error(f"Failed to send error notification: {e}")
+            raise InitializationError(f"Failed to validate project structure: {e}")
 
     def handle_shutdown(self, signum, frame):
         """Обработчик сигналов завершения"""
         self.logger.info("Received shutdown signal, cleaning up...")
         self.should_exit = True
 
-    async def process_topics(self):
-        """Обработка тем из files_1 и files_2"""
-        prompt1_dir = self.data_dir / "prompt_1"
-        prompt2_dir = self.data_dir / "prompt_2"
+    async def initialize_components(self):
+        """Инициализация компонентов системы"""
+        try:
+            # Инициализация UsageTracker
+            self.usage_tracker = ChunkUsageTracker(
+                usage_stats_file=self.config.get_path("usage_stats_file"),
+                logger=self.logger,
+                chunk_usage_limit=self.config.get("system", "chunk_usage_limit"),
+                usage_reset_days=self.config.get("system", "usage_reset_days"),
+                diversity_boost=self.config.get("system", "diversity_boost")
+            )
+            self.usage_tracker.cleanup_old_stats()
 
-        if not prompt1_dir.exists() or not prompt2_dir.exists():
-            raise ProcessingError("Prompt directories not found")
+            # Инициализация Retriever
+            self.retriever = HybridRetriever(
+                emb_model=self.config.get("retrieval", "embedding_model"),
+                cross_model=self.config.get("retrieval", "cross_encoder"),
+                index_file=self.config.get_path("index_file"),
+                context_file=self.config.get_path("context_file"),
+                inform_dir=self.config.get_path("inform_dir"),
+                chunk_size=self.config.get("retrieval", "chunk_size"),
+                overlap=self.config.get("retrieval", "overlap"),
+                top_k_title=self.config.get("retrieval", "top_k_title"),
+                top_k_faiss=self.config.get("retrieval", "top_k_faiss"),
+                top_k_final=self.config.get("retrieval", "top_k_final"),
+                usage_tracker=self.usage_tracker,
+                logger=self.logger
+            )
+
+            # Инициализация LMClient
+            self.lm = LMClient(
+                retriever=self.retriever,
+                data_dir=self.config.get_path("data_dir"),
+                inform_dir=self.config.get_path("inform_dir"),
+                logger=self.logger,
+                model_url=self.config.get("language_model", "url"),
+                model_name=self.config.get("language_model", "model_name"),
+                max_tokens=self.config.get("language_model", "max_tokens"),
+                max_chars=self.config.get("language_model", "max_chars"),
+                temperature=self.config.get("language_model", "temperature"),
+                timeout=self.config.get("language_model", "timeout"),
+                history_lim=self.config.get("language_model", "history_limit"),
+                system_msg=self.config.get("language_model", "system_message")
+            )
+
+            # Инициализация TelegramPublisher
+            telegram_config = self.config.get_telegram_config()
+            self.telegram = TelegramPublisher(
+                telegram_config["bot_token"],
+                telegram_config["channel_id"],
+                logger=self.logger,
+                max_retries=telegram_config.get("retry_attempts", 3),
+                retry_delay=telegram_config.get("retry_delay", 3.0),
+                enable_preview=telegram_config.get("enable_preview", True)
+            )
+
+            self.logger.info("All components initialized successfully")
+
+        except Exception as e:
+            raise InitializationError(f"Failed to initialize components: {e}")
+
+    async def process_topics(self):
+        """Обработка тем из prompt_1 и prompt_2"""
+        prompt1_dir = self.config.get_path("data_dir") / "prompt_1"
+        prompt2_dir = self.config.get_path("data_dir") / "prompt_2"
 
         prompt1_files = sorted(prompt1_dir.glob("*.txt"))
         prompt2_files = sorted(prompt2_dir.glob("*.txt"))
@@ -151,7 +173,7 @@ class RAGSystem:
         if not prompt1_files or not prompt2_files:
             raise ProcessingError("No prompt files found")
 
-        processed_topics = self.load_processed_topics()
+        processed_topics = self.state_manager.get_processed_topics()
 
         for file1 in prompt1_files:
             if self.should_exit:
@@ -161,39 +183,48 @@ class RAGSystem:
                 if self.should_exit:
                     break
 
-                topic = f"{file1.stem}_{file2.stem}"
+                topic_id = f"{file1.stem}_{file2.stem}"
                 
-                if topic in processed_topics:
+                if topic_id in processed_topics:
                     continue
 
                 try:
                     await self.process_single_topic(file1, file2)
-                    self.save_processed_topic(topic)
+                    self.state_manager.add_processed_topic(topic_id)
                 except Exception as e:
-                    error_msg = f"Error processing {topic}: {e}"
+                    error_msg = f"Error processing {topic_id}: {e}"
                     self.logger.error(error_msg)
-                    await self.notify_error(error_msg)
+                    self.state_manager.add_failed_topic(topic_id, str(e))
                     await asyncio.sleep(5)
 
     async def process_single_topic(self, file1: Path, file2: Path):
         """Обработка одной темы"""
-        topic = file1.stem
+        topic_id = f"{file1.stem}_{file2.stem}"
+        topic_content = f"{file1.stem} - {file2.stem}"
+        
         try:
             # Получение контекста
-            context = self.retriever.retrieve(topic)
-            context = enrich_context_with_tools(topic, context, self.inform_dir)
+            context = self.retriever.retrieve(topic_content)
+            try:
+                context = enrich_context_with_tools(
+                    topic_content,
+                    context,
+                    str(self.config.get_path("inform_dir"))
+                )
+            except Exception as e:
+                self.logger.error(f"Tool enrichment failed: {e}")
 
             # Генерация промпта
             prompt_full = get_prompt_parts(
-                data_dir=self.data_dir,
-                topic=topic,
+                data_dir=self.config.get_path("data_dir"),
+                topic=topic_content,
                 context=context,
                 file1=file1,
                 file2=file2
             )
 
             # Генерация текста
-            text = await self.lm.generate(topic)
+            text = await self.lm.generate(topic_content)
             if not text:
                 raise ProcessingError("Failed to generate text")
 
@@ -203,20 +234,26 @@ class RAGSystem:
             else:
                 await self.telegram.send_text(text)
 
-            self.logger.info(f"Successfully processed topic: {topic}")
+            self.logger.info(f"Successfully processed topic: {topic_id}")
 
         except Exception as e:
-            raise ProcessingError(f"Failed to process topic {topic}: {e}")
+            raise ProcessingError(f"Failed to process topic {topic_id}: {e}")
 
     async def handle_media_post(self, text: str):
         """Обработка поста с медиафайлом"""
+        media_file = None
         try:
-            media_file = prepare_media_for_post(self.media_dir)
+            media_file = prepare_media_for_post(self.config.get_path("media_dir"))
             if not media_file:
                 raise ProcessingError("No valid media file found")
 
             media_type = get_media_type(media_file)
             self.logger.info(f"Selected media file: {media_file} (type: {media_type})")
+
+            # Создаем временную копию файла
+            temp_file = self.temp_manager.create_temp_copy(media_file)
+            if not temp_file:
+                raise ProcessingError("Failed to create temporary file")
 
             media_handlers = {
                 "image": self.telegram.send_photo,
@@ -226,7 +263,7 @@ class RAGSystem:
             }
 
             if media_type in media_handlers:
-                await media_handlers[media_type](media_file, caption=text)
+                await media_handlers[media_type](temp_file, caption=text)
             else:
                 self.logger.warning(f"Unknown media type: {media_file}")
                 await self.telegram.send_text(text)
@@ -234,68 +271,55 @@ class RAGSystem:
         except Exception as e:
             self.logger.error(f"Media handling error: {e}")
             await self.telegram.send_text(text)
+        finally:
+            if media_file:
+                self.temp_manager.cleanup_file(media_file)
 
     async def run(self):
         """Основной метод запуска системы"""
         try:
-            # Загрузка конфигурации
-            config = self.load_config()
-            
             # Инициализация компонентов
-            self.usage_tracker = ChunkUsageTracker(
-                usage_stats_file=self.usage_stats_file,
-                logger=self.logger,
-                chunk_usage_limit=config["chunk_usage_limit"],
-                usage_reset_days=config["usage_reset_days"],
-                diversity_boost=config["diversity_boost"]
-            )
-            self.usage_tracker.cleanup_old_stats()
+            await self.initialize_components()
+            
+            # Проверка соединения с Telegram
+            if not await self.telegram.check_connection():
+                raise TelegramError("Failed to connect to Telegram")
 
-            self.retriever = HybridRetriever(
-                emb_model=config["emb_model"],
-                cross_model=config["cross_model"],
-                index_file=self.index_file,
-                context_file=self.context_file,
-                inform_dir=self.inform_dir,
-                chunk_size=config["chunk_size"],
-                overlap=config["overlap"],
-                top_k_title=config["top_k_title"],
-                top_k_faiss=config["top_k_faiss"],
-                top_k_final=config["top_k_final"],
-                usage_tracker=self.usage_tracker,
-                logger=self.logger
-            )
-
-            self.lm = LMClient(
-                retriever=self.retriever,
-                data_dir=self.data_dir,
-                inform_dir=self.inform_dir,
-                logger=self.logger
-            )
-
-            self.telegram = TelegramPublisher(
-                config["bot_token"],
-                config["channel_id"],
-                logger=self.logger
-            )
-
+            self.logger.info("System initialized successfully")
+            
+            # Очистка старых временных файлов
+            self.temp_manager.cleanup_old_files()
+            
             # Основной цикл обработки
             await self.process_topics()
 
-        except ConfigurationError as e:
-            self.logger.critical(f"Configuration error: {e}")
-            await self.notify_error(f"Configuration error: {e}")
-            sys.exit(1)
         except Exception as e:
-            self.logger.critical(f"Unexpected error: {e}")
-            await self.notify_error(f"Unexpected error: {e}")
-            sys.exit(1)
+            self.logger.critical(f"System error: {e}")
+            # Попытка отправить уведомление об ошибке
+            try:
+                await self.telegram.send_text(f"🚨 Critical system error: {e}")
+            except:
+                pass
+            raise
         finally:
+            # Сохранение состояния и очистка
             if hasattr(self, 'usage_tracker'):
                 self.usage_tracker.save_statistics()
+            self.state_manager.save_state()
+            self.temp_manager.cleanup_old_files()
             self.logger.info("System shutdown complete")
 
 if __name__ == '__main__':
+    # Установка обработчика нераспознанных исключений
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    
+    sys.excepthook = handle_exception
+    
+    # Запуск системы
     rag_system = RAGSystem()
     try:
         asyncio.run(rag_system.run())
@@ -3283,3 +3307,255 @@ def enrich_context_with_tools(
     else:
         logger.info("Инструменты не были использованы для расширения контекста.")
     return context
+
+# код - utils/config_manager.py
+from pathlib import Path
+import json
+from typing import Any, Dict, Optional
+import logging
+
+class ConfigManager:
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.logger = logging.getLogger("config_manager")
+        self.config = self._load_config()
+        self._validate_config()
+
+    def _load_config(self) -> Dict[str, Any]:
+        """Загрузка конфигурации из файла"""
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.critical(f"Failed to load configuration: {e}")
+            raise
+
+    def _validate_config(self):
+        """Валидация конфигурации"""
+        required_sections = ['telegram', 'language_model', 'retrieval', 'system', 'paths']
+        for section in required_sections:
+            if section not in self.config:
+                raise ValueError(f"Missing required config section: {section}")
+
+    def get_telegram_config(self) -> Dict[str, Any]:
+        """Получение конфигурации Telegram"""
+        config = self.config['telegram'].copy()
+        
+        # Загрузка токена и channel_id из файлов
+        try:
+            token_file = Path(config['bot_token_file'])
+            channel_file = Path(config['channel_id_file'])
+            
+            if not token_file.exists():
+                raise ValueError(f"Telegram token file not found: {token_file}")
+            if not channel_file.exists():
+                raise ValueError(f"Channel ID file not found: {channel_file}")
+            
+            config['bot_token'] = token_file.read_text(encoding='utf-8').strip()
+            config['channel_id'] = channel_file.read_text(encoding='utf-8').strip()
+            
+            return config
+        except Exception as e:
+            self.logger.critical(f"Failed to load Telegram credentials: {e}")
+            raise
+
+    def get_path(self, path_key: str) -> Path:
+        """Получение пути из конфигурации"""
+        if path_key not in self.config['paths']:
+            raise KeyError(f"Path not found in config: {path_key}")
+        return Path(self.config['paths'][path_key])
+
+    def get(self, section: str, key: str, default: Any = None) -> Any:
+        """Получение значения из конфигурации"""
+        return self.config.get(section, {}).get(key, default)
+
+    def update(self, section: str, key: str, value: Any):
+        """Обновление значения в конфигурации"""
+        if section not in self.config:
+            self.config[section] = {}
+        self.config[section][key] = value
+        self._save_config()
+
+    def _save_config(self):
+        """Сохранение конфигурации в файл"""
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"Failed to save configuration: {e}")
+            raise
+
+# код -  utils/exceptions.py
+class RAGException(Exception):
+    """Базовый класс для исключений RAG системы"""
+    pass
+
+class ConfigurationError(RAGException):
+    """Ошибки конфигурации"""
+    pass
+
+class InitializationError(RAGException):
+    """Ошибки инициализации компонентов"""
+    pass
+
+class ProcessingError(RAGException):
+    """Ошибки обработки данных"""
+    pass
+
+class ModelError(RAGException):
+    """Ошибки языковой модели"""
+    pass
+
+class TelegramError(RAGException):
+    """Ошибки взаимодействия с Telegram"""
+    pass
+
+class FileOperationError(RAGException):
+    """Ошибки файловых операций"""
+    pass
+
+
+# код - utils/state_manager.py
+from pathlib import Path
+import json
+from typing import Dict, Any, Set
+from datetime import datetime
+import logging
+
+class StateManager:
+    def __init__(self, state_file: Path):
+        self.state_file = state_file
+        self.logger = logging.getLogger("state_manager")
+        self.state: Dict[str, Any] = self._load_state()
+
+    def _load_state(self) -> Dict[str, Any]:
+        """Загрузка состояния из файла"""
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                self.logger.error(f"Failed to load state: {e}")
+                return self._create_default_state()
+        return self._create_default_state()
+
+    def _create_default_state(self) -> Dict[str, Any]:
+        """Создание состояния по умолчанию"""
+        return {
+            "last_update": datetime.utcnow().isoformat(),
+            "processed_topics": set(),
+            "failed_topics": {},
+            "statistics": {
+                "total_processed": 0,
+                "successful": 0,
+                "failed": 0
+            }
+        }
+
+    def save_state(self):
+        """Сохранение состояния"""
+        try:
+            # Конвертируем set в list для JSON
+            state_copy = self.state.copy()
+            state_copy["processed_topics"] = list(self.state["processed_topics"])
+            state_copy["last_update"] = datetime.utcnow().isoformat()
+
+            with open(self.state_file, 'w', encoding='utf-8') as f:
+                json.dump(state_copy, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"Failed to save state: {e}")
+            raise
+
+    def add_processed_topic(self, topic: str):
+        """Добавление обработанной темы"""
+        self.state["processed_topics"].add(topic)
+        self.state["statistics"]["total_processed"] += 1
+        self.state["statistics"]["successful"] += 1
+        self.save_state()
+
+    def add_failed_topic(self, topic: str, error: str):
+        """Добавление темы с ошибкой"""
+        self.state["failed_topics"][topic] = {
+            "error": error,
+            "timestamp": datetime.utcnow().isoformat(),
+            "attempts": self.state["failed_topics"].get(topic, {}).get("attempts", 0) + 1
+        }
+        self.state["statistics"]["failed"] += 1
+        self.save_state()
+
+    def get_processed_topics(self) -> Set[str]:
+        """Получение списка обработанных тем"""
+        return self.state["processed_topics"]
+
+    def get_failed_topics(self) -> Dict[str, Dict[str, Any]]:
+        """Получение списка тем с ошибками"""
+        return self.state["failed_topics"]
+
+    def get_statistics(self) -> Dict[str, int]:
+        """Получение статистики"""
+        return self.state["statistics"]
+
+    def clear_failed_topics(self):
+        """Очистка списка тем с ошибками"""
+        self.state["failed_topics"].clear()
+        self.save_state()
+
+# код - utils/file_manager.py
+
+from pathlib import Path
+import shutil
+import tempfile
+from typing import Optional, List
+import logging
+from datetime import datetime, timedelta
+
+class TempFileManager:
+    def __init__(self, temp_dir: Path):
+        self.temp_dir = temp_dir
+        self.logger = logging.getLogger("temp_file_manager")
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        
+    def create_temp_copy(self, source: Path) -> Optional[Path]:
+        """Создание временной копии файла"""
+        if not source.exists():
+            return None
+        
+        try:
+            temp_file = self.temp_dir / f"temp_{datetime.utcnow().timestamp()}_{source.name}"
+            shutil.copy2(source, temp_file)
+            return temp_file
+        except Exception as e:
+            self.logger.error(f"Failed to create temp copy of {source}: {e}")
+            return None
+
+    def cleanup_old_files(self, max_age_hours: int = 24):
+        """Очистка старых временных файлов"""
+        cutoff_time = datetime.utcnow() - timedelta(hours=max_age_hours)
+        
+        try:
+            for file in self.temp_dir.glob("temp_*"):
+                try:
+                    # Извлекаем timestamp из имени файла
+                    timestamp = float(file.name.split('_')[1])
+                    file_time = datetime.fromtimestamp(timestamp)
+                    
+                    if file_time < cutoff_time:
+                        file.unlink()
+                except (ValueError, IndexError):
+                    # Если не удалось извлечь timestamp, пропускаем файл
+                    continue
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
+
+    def get_temp_file_path(self, prefix: str = "") -> Path:
+        """Получение пути для нового временного файла"""
+        return self.temp_dir / f"temp_{prefix}_{datetime.utcnow().timestamp()}"
+
+    def cleanup_file(self, file_path: Optional[Path]):
+        """Безопасное удаление временного файла"""
+        if file_path and file_path.exists() and file_path.parent == self.temp_dir:
+            try:
+                file_path.unlink()
+            except Exception as e:
+                self.logger.error(f"Failed to cleanup file {file_path}: {e}")
+

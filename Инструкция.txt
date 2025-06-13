@@ -1,0 +1,181 @@
+# Инструкция по запуску RAG-бота для Telegram-канала
+
+---
+
+## 1. Установка зависимостей
+
+### 1.1. Создайте и активируйте виртуальное окружение (рекомендуется):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+# или для Windows:
+# .venv\Scripts\activate
+```
+
+### 1.2. Установите необходимые библиотеки:
+
+```bash
+pip install -r requirements.txt
+```
+
+**Содержимое `requirements.txt` должно быть примерно таким:**
+```text
+numpy
+faiss-cpu
+sentence-transformers
+pandas
+python-telegram-bot>=20.0
+python-docx
+beautifulsoup4
+requests
+aiofiles
+```
+> **NB:** Если используете CUDA/GPU, установите `faiss-gpu` вместо `faiss-cpu`.
+
+---
+
+## 2. Подготовка структуры проекта
+
+ main.py — точка входа
+
+    Запускает пайплайн, инициализирует все основные компоненты.
+    Вызывает:
+        rag_lmclient.py (управляет генерацией текста)
+        rag_telegram.py (отправка сообщений/медиа в Telegram)
+
+2. rag_lmclient.py
+
+    Обеспечивает генерацию текста через LLM (через API или локально).
+    Для подготовки промта и наполнения контекстом вызывает:
+        rag_langchain_tools.py (enrich_context_with_tools)
+        rag_prompt_utils.py (get_prompt_parts)
+    Может использовать image_utils.py для обработки/выбора медиа-файлов.
+
+3. rag_langchain_tools.py
+
+    Это “интеллектуальный диспетчер инструментов” — анализирует запрос, вызывает нужные утилиты:
+        rag_file_utils.py (парсинг и извлечение текста из файлов)
+        rag_table_utils.py (структуризация и преобразование таблиц)
+        rag_text_utils.py (чанкинг и обработка текстов)
+        rag_prompt_utils.py (генерация промтов)
+    Сам не реализует низкоуровневую логику, а лишь маршрутизирует вызовы.
+
+4. rag_file_utils.py, rag_table_utils.py, rag_text_utils.py, rag_prompt_utils.py
+
+    Не зависят друг от друга напрямую, но могут вызывать друг друга по мере необходимости (например, process_table_for_rag может использовать clean_html_from_cell из rag_file_utils.py).
+    Используются из agent/dspatcher-слоя (rag_langchain_tools.py).
+
+5. rag_telegram.py
+
+    Занимается отправкой сообщений, фото, видео, файлов в Telegram.
+    Может использовать image_utils.py для валидирования и подготовки медиа.
+
+6. rag_chunk_tracker.py
+
+    Трекинг использования чанков текстов — используется в retrieval-слое или при подготовке данных.
+
+7. rag_retriever.py
+
+    Ядро поиска по векторам, индексы, кросс-энкодер, возможно — использует rag_file_utils.py для парсинга данных при сборке индекса.
+
+8. RAG_Pipeline_Extensions_Utils.py
+
+    Расширенные функции: ingestion, аналитика, веб-интерфейс, конфиг-менеджмент, бенчмаркинг.
+    Может использовать любой из утилитарных модулей, используется для загрузки/анализа/мониторинга.
+
+9. search_utils.py
+
+    Альтернативный или дополнительный retrieval-слой (например, на ChromaDB).
+
+10. image_utils.py
+
+    Обработка изображений и медиа (resize, валидация, выбор случайного файла).
+    Используется из rag_lmclient.py и rag_telegram.py.
+
+Основной поток:
+
+    main.py → rag_lmclient.py → rag_langchain_tools.py → (утилиты) → возвращает enriched context
+    main.py → rag_telegram.py → image_utils.py
+
+Вспомогательные потоки:
+
+    rag_retriever.py/HybridRetriever → rag_file_utils.py (при построении индекса)
+    rag_chunk_tracker.py → для ведения usage-статистики
+    RAG_Pipeline_Extensions_Utils.py → ingestion/аналитика/мониторинг/тесты
+
+**Скопируйте или создайте структуру:**
+```
+project_root/
+│
+├── main.py                # Точка входа (предположительно)
+├── rag_file_utils.py
+├── rag_table_utils.py
+├── rag_text_utils.py
+├── rag_prompt_utils.py
+├── rag_lmclient.py        # Класс LMClient (генерация текста, взаимодействие с API)
+├── rag_langchain_tools.py # enrich_context_with_tools и др. тулзы
+├── rag_chunk_tracker.py
+├── rag_retriever.py
+├── rag_telegram.py
+├── RAG_Pipeline_Extensions_Utils.py
+├── logs.py
+├── search_utils.py
+├── media/                 # Только хранимые/отправляемые медиа-файлы
+│   ├── пока пусто, будет файл
+│   ├── пока пусто, будут папки с файлами
+│   └── ...
+├── config/      # папка с двумя файлами (допускается проработка
+│   ├── telegram_channel.txt  #id канала
+│   └── telegram_token.txt  #токен телеграм
+├── image_utils.py         # (будет создан) обработка изображений/медиа
+├── data/
+│   ├── prompt_1/  # список txt файлов с разными названиями из первой части промта
+│   │   └── ... (txt)
+│   ├── prompt_2/   # список txt файлов с разными названиями из второй части промта
+│   │   └── ... (txt)
+│   ├── topics.txt  # список тем
+│   └── processed_topics.txt # список отработанных тем
+├── inform/
+│   └── ... (ваши .txt, .csv, .xlsx, .docx и т.п.)  # список файлов с полезной информацией для RAG системы
+└── requirements.txt
+```
+- В `data/topics.txt` — список тем, по одной на строку.
+- В `data/prompt_1/` и `data/prompt_2/` — ваши шаблоны промтов.
+- В `inform/` — ваши файлы знаний (поддерживаются: txt, html, docx, doc, csv, xlsx).
+
+
+
+## 4. Возможные проблемы
+
+- **Нет библиотек**: Проверьте, что все из `requirements.txt` установлены.
+- **Нет GPU/CPU FAISS**: Установите подходящий пакет (`faiss-cpu` или `faiss-gpu`).
+- **Проблемы с Telegram**: Проверьте токен, права бота и что бот добавлен в канал как администратор.
+- **Ошибка чтения файлов**: Проверьте кодировку и целостность файлов в `inform/`.
+- **Слишком длинный пост**: Скрипт сам обрезает до лимита Telegram, но лучше заранее делать шаблоны и темы короче.
+
+---
+
+## 5. Рекомендации
+
+- Для production-сценария используйте screen/tmux/systemd для автозапуска.
+- Регулярно очищайте логи и обновляйте usage_statistics.json.
+- Следите за обновлениями библиотек и моделей.
+
+---
+
+## 6. Пример запуска цикла вручную
+
+```bash
+python main.py
+```
+- После завершения темы из `topics.txt` будут автоматически очищены.
+- Новые темы можно добавлять в `topics.txt` в любой момент.
+
+---
+
+**Если потребуется интеграция с другой LLM, измените параметры LM_URL, LM_MODEL, MAX_TOKENS в main.py и rag_lmclient.py.**
+
+---
+Copilot said: ### Глубокий анализ: конфликтует ли rag_langchain_tools.py с
+Глубокий анализ: конфликтует ли rag_langchain_tools.py с search_utils.py и RAG_Pipeline_Extensions_Utils.py

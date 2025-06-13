@@ -117,7 +117,10 @@ class RAGSystem:
         # Создание файла для обработанных тем если не существует
         self.processed_topics_file.touch(exist_ok=True)
 
-    def load_config(self) -> Dict[str, Any]:
+    def __init__(self):
+        self.base_dir = Path(__file__).parent
+        self.config_manager = ConfigManager(self.base_dir / "config" / "config.json")
+        self.setup_paths()
         """Загрузка конфигурации из файлов"""
         try:
             # Проверяем наличие необходимых файлов

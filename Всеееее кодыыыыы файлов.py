@@ -1,19 +1,16 @@
 # код - main.py
 
-# main.py
 import asyncio
 import sys
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 import signal
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
+from dataclasses import dataclass, asdict
+import json
 
-from utils.config_manager import ConfigManager
-from utils.state_manager import StateManager
-from utils.file_manager import TempFileManager
-from utils.exceptions import *
-
+from logs import get_logger
 from rag_chunk_tracker import ChunkUsageTracker
 from rag_retriever import HybridRetriever
 from rag_telegram import TelegramPublisher
@@ -22,238 +19,344 @@ from rag_langchain_tools import enrich_context_with_tools
 from rag_prompt_utils import get_prompt_parts
 from image_utils import prepare_media_for_post, get_media_type
 
+@dataclass
+class SystemStats:
+    """Статистика работы системы"""
+    total_topics: int = 0
+    processed_topics: int = 0
+    failed_topics: int = 0
+    start_time: Optional[datetime] = None
+    current_topic: Optional[str] = None
+    last_error: Optional[str] = None
+    last_processing_time: Optional[float] = None
+    total_chars_generated: int = 0
+    avg_chars_per_topic: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        stats = asdict(self)
+        if self.start_time:
+            stats['start_time'] = self.start_time.isoformat()
+            stats['running_time'] = str(datetime.now() - self.start_time)
+        stats['success_rate'] = (
+            (self.processed_topics / self.total_topics * 100)
+            if self.total_topics > 0 else 0
+        )
+        return stats
+
+class RAGException(Exception):
+    """Базовый класс для исключений RAG системы"""
+    pass
+
+class ConfigurationError(RAGException):
+    """Ошибки конфигурации"""
+    pass
+
+class InitializationError(RAGException):
+    """Ошибки инициализации компонентов"""
+    pass
+
+class ProcessingError(RAGException):
+    """Ошибки обработки данных"""
+    pass
+
 class RAGSystem:
     def __init__(self):
-        # Базовые пути
+        # Базовая инициализация
         self.base_dir = Path(__file__).parent
+        self.setup_paths()
+        self.logger = get_logger(__name__, logfile=self.log_dir / "bot.log")
         
-        # Инициализация конфигурации
-        self.config = ConfigManager(self.base_dir / "config" / "config.json")
+        # Статистика
+        self.stats = SystemStats()
         
-        # Настройка логирования
-        self.setup_logging()
-        
-        # Инициализация менеджеров
-        self.state_manager = StateManager(
-            self.config.get_path("processed_topics_file")
-        )
-        self.temp_manager = TempFileManager(
-            self.config.get_path("temp_dir")
-        )
+        # Множество обработанных тем для быстрой проверки
+        self._processed_topics: Set[str] = set()
         
         # Флаг для graceful shutdown
         self.should_exit = False
         signal.signal(signal.SIGINT, self.handle_shutdown)
         signal.signal(signal.SIGTERM, self.handle_shutdown)
-        
-        # Валидация структуры проекта
-        self.validate_project_structure()
 
-    def setup_logging(self):
-        """Настройка системы логирования"""
-        log_dir = self.config.get_path("log_dir")
-        log_dir.mkdir(parents=True, exist_ok=True)
+    def setup_paths(self):
+        """Инициализация и проверка необходимых директорий"""
+        # Основные директории
+        self.data_dir = self.base_dir / "data"
+        self.log_dir = self.base_dir / "logs"
+        self.inform_dir = self.base_dir / "inform"
+        self.config_dir = self.base_dir / "config"
+        self.media_dir = self.base_dir / "media"
         
-        self.logger = logging.getLogger("rag_system")
-        self.logger.setLevel(logging.INFO)
-        
-        # Файловый handler
-        file_handler = logging.FileHandler(
-            log_dir / f"rag_{datetime.utcnow().strftime('%Y%m%d')}.log",
-            encoding='utf-8'
-        )
-        file_handler.setFormatter(
-            logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-        )
-        self.logger.addHandler(file_handler)
-        
-        # Консольный handler
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(
-            logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-        )
-        self.logger.addHandler(console_handler)
+        # Важные файлы
+        self.topics_file = self.data_dir / "topics.txt"
+        self.processed_topics_file = self.data_dir / "processed_topics.txt"
+        self.index_file = self.data_dir / "faiss_index.idx"
+        self.context_file = self.data_dir / "faiss_contexts.json"
+        self.usage_stats_file = self.data_dir / "usage_statistics.json"
 
-    def validate_project_structure(self):
-        """Проверка структуры проекта"""
+        # Создание директорий если не существуют
         required_dirs = [
-            "data_dir",
-            "log_dir",
-            "inform_dir",
-            "media_dir"
+            self.data_dir,
+            self.log_dir,
+            self.inform_dir,
+            self.config_dir,
+            self.media_dir,
+            self.data_dir / "prompt_1",
+            self.data_dir / "prompt_2"
         ]
         
+        for directory in required_dirs:
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                raise InitializationError(f"Failed to create directory {directory}: {e}")
+
+        # Проверка существования критичных файлов
+        if not self.topics_file.exists():
+            raise ConfigurationError("topics.txt not found")
+        
+        # Создание файла для обработанных тем если не существует
+        self.processed_topics_file.touch(exist_ok=True)
+
+    def load_config(self) -> Dict[str, Any]:
+        """Загрузка конфигурации из файлов"""
         try:
-            for dir_key in required_dirs:
-                dir_path = self.config.get_path(dir_key)
-                dir_path.mkdir(parents=True, exist_ok=True)
-                
-                if dir_key == "data_dir":
-                    (dir_path / "prompt_1").mkdir(exist_ok=True)
-                    (dir_path / "prompt_2").mkdir(exist_ok=True)
-            
-            self.logger.info("Project structure validated successfully")
+            # Проверяем наличие необходимых файлов
+            token_file = self.config_dir / "telegram_token.txt"
+            channel_file = self.config_dir / "telegram_channel.txt"
+
+            if not token_file.exists():
+                raise ConfigurationError("telegram_token.txt not found")
+            if not channel_file.exists():
+                raise ConfigurationError("telegram_channel.txt not found")
+
+            # Читаем конфигурацию
+            bot_token = token_file.read_text(encoding="utf-8").strip()
+            channel_id = channel_file.read_text(encoding="utf-8").strip()
+
+            if not bot_token or not channel_id:
+                raise ConfigurationError(
+                    "Telegram token or channel ID is empty"
+                )
+
+            # Возвращаем полную конфигурацию
+            return {
+                "telegram": {
+                    "bot_token": bot_token,
+                    "channel_id": channel_id,
+                    "retry_attempts": 3,
+                    "retry_delay": 3.0,
+                    "enable_preview": True
+                },
+                "llm": {
+                    "model_url": "http://localhost:1234/v1/chat/completions",
+                    "model_name": "gemma-3-27b-it-GGUF/gemma-3-27b-it-Q4_K_M.gguf",
+                    "max_tokens": 4096,
+                    "max_chars": 4096,
+                    "max_chars_with_media": 1024,
+                    "temperature": 0.7,
+                    "timeout": 40,
+                    "history_limit": 3
+                },
+                "rag": {
+                    "chunk_usage_limit": 10,
+                    "usage_reset_days": 7,
+                    "diversity_boost": 0.3,
+                    "emb_model": "all-MiniLM-L6-v2",
+                    "cross_model": "cross-encoder/stsb-roberta-large",
+                    "chunk_size": 500,
+                    "overlap": 100,
+                    "top_k_title": 2,
+                    "top_k_faiss": 8,
+                    "top_k_final": 3
+                }
+            }
         except Exception as e:
-            raise InitializationError(f"Failed to validate project structure: {e}")
+            raise ConfigurationError(f"Failed to load configuration: {e}")
+
+    def load_processed_topics(self) -> Set[str]:
+        """Загрузка списка обработанных тем"""
+        try:
+            if self.processed_topics_file.exists():
+                topics = set(self.processed_topics_file.read_text(
+                    encoding='utf-8').splitlines())
+                self.logger.info(f"Loaded {len(topics)} processed topics")
+                return topics
+            return set()
+        except Exception as e:
+            self.logger.warning(f"Failed to load processed topics: {e}")
+            return set()
+
+    def save_processed_topic(self, topic: str):
+        """Сохранение обработанной темы"""
+        try:
+            if topic not in self._processed_topics:
+                with open(self.processed_topics_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{topic}\n")
+                self._processed_topics.add(topic)
+                self.logger.info(f"Topic '{topic}' marked as processed")
+        except Exception as e:
+            self.logger.error(f"Failed to save processed topic: {e}")
+
+    async def notify_error(self, message: str):
+        """Отправка уведомления об ошибке в Telegram"""
+        if hasattr(self, 'telegram'):
+            try:
+                await self.telegram.send_text(
+                    f"🚨 RAG System Error:\n{message}"
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to send error notification: {e}")
 
     def handle_shutdown(self, signum, frame):
         """Обработчик сигналов завершения"""
         self.logger.info("Received shutdown signal, cleaning up...")
         self.should_exit = True
-
-    async def initialize_components(self):
-        """Инициализация компонентов системы"""
+        
+        # Сохранение статистики перед выходом
         try:
-            # Инициализация UsageTracker
-            self.usage_tracker = ChunkUsageTracker(
-                usage_stats_file=self.config.get_path("usage_stats_file"),
-                logger=self.logger,
-                chunk_usage_limit=self.config.get("system", "chunk_usage_limit"),
-                usage_reset_days=self.config.get("system", "usage_reset_days"),
-                diversity_boost=self.config.get("system", "diversity_boost")
-            )
-            self.usage_tracker.cleanup_old_stats()
-
-            # Инициализация Retriever
-            self.retriever = HybridRetriever(
-                emb_model=self.config.get("retrieval", "embedding_model"),
-                cross_model=self.config.get("retrieval", "cross_encoder"),
-                index_file=self.config.get_path("index_file"),
-                context_file=self.config.get_path("context_file"),
-                inform_dir=self.config.get_path("inform_dir"),
-                chunk_size=self.config.get("retrieval", "chunk_size"),
-                overlap=self.config.get("retrieval", "overlap"),
-                top_k_title=self.config.get("retrieval", "top_k_title"),
-                top_k_faiss=self.config.get("retrieval", "top_k_faiss"),
-                top_k_final=self.config.get("retrieval", "top_k_final"),
-                usage_tracker=self.usage_tracker,
-                logger=self.logger
-            )
-
-            # Инициализация LMClient
-            self.lm = LMClient(
-                retriever=self.retriever,
-                data_dir=self.config.get_path("data_dir"),
-                inform_dir=self.config.get_path("inform_dir"),
-                logger=self.logger,
-                model_url=self.config.get("language_model", "url"),
-                model_name=self.config.get("language_model", "model_name"),
-                max_tokens=self.config.get("language_model", "max_tokens"),
-                max_chars=self.config.get("language_model", "max_chars"),
-                temperature=self.config.get("language_model", "temperature"),
-                timeout=self.config.get("language_model", "timeout"),
-                history_lim=self.config.get("language_model", "history_limit"),
-                system_msg=self.config.get("language_model", "system_message")
-            )
-
-            # Инициализация TelegramPublisher
-            telegram_config = self.config.get_telegram_config()
-            self.telegram = TelegramPublisher(
-                telegram_config["bot_token"],
-                telegram_config["channel_id"],
-                logger=self.logger,
-                max_retries=telegram_config.get("retry_attempts", 3),
-                retry_delay=telegram_config.get("retry_delay", 3.0),
-                enable_preview=telegram_config.get("enable_preview", True)
-            )
-
-            self.logger.info("All components initialized successfully")
-
+            stats = self.stats.to_dict()
+            stats_file = self.log_dir / f"stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(stats_file, 'w', encoding='utf-8') as f:
+                json.dump(stats, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Statistics saved to {stats_file}")
         except Exception as e:
-            raise InitializationError(f"Failed to initialize components: {e}")
+            self.logger.error(f"Failed to save statistics: {e}")
+
+    def _load_remaining_topics(self) -> List[str]:
+        """Загрузка оставшихся тем для обработки"""
+        try:
+            all_topics = self.topics_file.read_text(encoding='utf-8').splitlines()
+            remaining = [t for t in all_topics if t not in self._processed_topics]
+            self.logger.info(f"Loaded {len(remaining)} remaining topics")
+            return remaining
+        except Exception as e:
+            raise ProcessingError(f"Failed to load topics: {e}")
 
     async def process_topics(self):
-        """Обработка тем из prompt_1 и prompt_2"""
-        prompt1_dir = self.config.get_path("data_dir") / "prompt_1"
-        prompt2_dir = self.config.get_path("data_dir") / "prompt_2"
-
-        prompt1_files = sorted(prompt1_dir.glob("*.txt"))
-        prompt2_files = sorted(prompt2_dir.glob("*.txt"))
-
-        if not prompt1_files or not prompt2_files:
-            raise ProcessingError("No prompt files found")
-
-        processed_topics = self.state_manager.get_processed_topics()
-
-        for file1 in prompt1_files:
+        """Обработка тем из topics.txt"""
+        # Загрузка обработанных тем
+        self._processed_topics = self.load_processed_topics()
+        
+        # Загрузка оставшихся тем
+        topics = self._load_remaining_topics()
+        
+        # Инициализация статистики
+        self.stats.total_topics = len(topics)
+        self.stats.start_time = datetime.now()
+        
+        # Обработка тем
+        for topic in topics:
             if self.should_exit:
                 break
 
-            for file2 in prompt2_files:
-                if self.should_exit:
-                    break
+            self.stats.current_topic = topic
+            processing_start = datetime.now()
 
-                topic_id = f"{file1.stem}_{file2.stem}"
-                
-                if topic_id in processed_topics:
-                    continue
-
-                try:
-                    await self.process_single_topic(file1, file2)
-                    self.state_manager.add_processed_topic(topic_id)
-                except Exception as e:
-                    error_msg = f"Error processing {topic_id}: {e}"
-                    self.logger.error(error_msg)
-                    self.state_manager.add_failed_topic(topic_id, str(e))
-                    await asyncio.sleep(5)
-
-    async def process_single_topic(self, file1: Path, file2: Path):
-        """Обработка одной темы"""
-        topic_id = f"{file1.stem}_{file2.stem}"
-        topic_content = f"{file1.stem} - {file2.stem}"
-        
-        try:
-            # Получение контекста
-            context = self.retriever.retrieve(topic_content)
             try:
-                context = enrich_context_with_tools(
-                    topic_content,
-                    context,
-                    str(self.config.get_path("inform_dir"))
+                self.logger.info(
+                    f"Processing topic {self.stats.processed_topics + 1}/{self.stats.total_topics}: {topic}"
                 )
+                
+                # Обработка темы
+                text_length = await self.process_single_topic(topic)
+                
+                # Обновление статистики
+                self.stats.processed_topics += 1
+                self.stats.total_chars_generated += text_length
+                self.stats.avg_chars_per_topic = (
+                    self.stats.total_chars_generated / self.stats.processed_topics
+                )
+                
+                # Сохранение прогресса
+                self.save_processed_topic(topic)
+                
+                # Обновление времени обработки
+                self.stats.last_processing_time = (
+                    datetime.now() - processing_start
+                ).total_seconds()
+                
             except Exception as e:
-                self.logger.error(f"Tool enrichment failed: {e}")
+                error_msg = f"Error processing topic {topic}: {e}"
+                self.logger.error(error_msg)
+                self.stats.failed_topics += 1
+                self.stats.last_error = error_msg
+                await self.notify_error(error_msg)
+                await asyncio.sleep(5)
+
+    async def process_single_topic(self, topic: str) -> int:
+        """
+        Обработка одной темы.
+        Возвращает длину сгенерированного текста.
+        """
+        try:
+            # Получение контекста из RAG
+            context = self.retriever.retrieve(topic)
+            
+            # Обогащение контекста дополнительными инструментами
+            context = enrich_context_with_tools(topic, context, self.inform_dir)
+            
+            # Поиск файлов промптов
+            prompt1_files = sorted((self.data_dir / "prompt_1").glob("*.txt"))
+            prompt2_files = sorted((self.data_dir / "prompt_2").glob("*.txt"))
+            
+            if not prompt1_files or not prompt2_files:
+                raise ProcessingError("No prompt files found")
+            
+            # Случайный выбор файлов промптов
+            import random
+            file1 = random.choice(prompt1_files)
+            file2 = random.choice(prompt2_files)
 
             # Генерация промпта
             prompt_full = get_prompt_parts(
-                data_dir=self.config.get_path("data_dir"),
-                topic=topic_content,
+                data_dir=self.data_dir,
+                topic=topic,
                 context=context,
                 file1=file1,
                 file2=file2
             )
 
+            # Определение максимальной длины текста
+            max_chars = (
+                self.config["llm"]["max_chars_with_media"]
+                if "{UPLOADFILE}" in prompt_full
+                else self.config["llm"]["max_chars"]
+            )
+
             # Генерация текста
-            text = await self.lm.generate(topic_content)
+            text = await self.lm.generate(
+                topic,
+                max_chars=max_chars
+            )
+            
             if not text:
                 raise ProcessingError("Failed to generate text")
 
-            # Обработка медиафайла если нужно
+            # Отправка в Telegram
             if "{UPLOADFILE}" in prompt_full:
                 await self.handle_media_post(text)
             else:
                 await self.telegram.send_text(text)
 
-            self.logger.info(f"Successfully processed topic: {topic_id}")
+            self.logger.info(
+                f"Successfully processed topic: {topic}, "
+                f"text length: {len(text)}"
+            )
+            
+            return len(text)
 
         except Exception as e:
-            raise ProcessingError(f"Failed to process topic {topic_id}: {e}")
+            raise ProcessingError(f"Failed to process topic {topic}: {e}")
 
     async def handle_media_post(self, text: str):
         """Обработка поста с медиафайлом"""
-        media_file = None
         try:
-            media_file = prepare_media_for_post(self.config.get_path("media_dir"))
+            media_file = prepare_media_for_post(self.media_dir)
             if not media_file:
                 raise ProcessingError("No valid media file found")
 
             media_type = get_media_type(media_file)
             self.logger.info(f"Selected media file: {media_file} (type: {media_type})")
-
-            # Создаем временную копию файла
-            temp_file = self.temp_manager.create_temp_copy(media_file)
-            if not temp_file:
-                raise ProcessingError("Failed to create temporary file")
 
             media_handlers = {
                 "image": self.telegram.send_photo,
@@ -263,7 +366,7 @@ class RAGSystem:
             }
 
             if media_type in media_handlers:
-                await media_handlers[media_type](temp_file, caption=text)
+                await media_handlers[media_type](media_file, caption=text)
             else:
                 self.logger.warning(f"Unknown media type: {media_file}")
                 await self.telegram.send_text(text)
@@ -271,52 +374,103 @@ class RAGSystem:
         except Exception as e:
             self.logger.error(f"Media handling error: {e}")
             await self.telegram.send_text(text)
-        finally:
-            if media_file:
-                self.temp_manager.cleanup_file(media_file)
 
     async def run(self):
         """Основной метод запуска системы"""
         try:
-            # Инициализация компонентов
-            await self.initialize_components()
+            # Загрузка конфигурации
+            self.config = self.load_config()
             
+            # Инициализация компонентов
+            self.usage_tracker = ChunkUsageTracker(
+                usage_stats_file=self.usage_stats_file,
+                logger=self.logger,
+                chunk_usage_limit=self.config["rag"]["chunk_usage_limit"],
+                usage_reset_days=self.config["rag"]["usage_reset_days"],
+                diversity_boost=self.config["rag"]["diversity_boost"]
+            )
+            self.usage_tracker.cleanup_old_stats()
+
+            self.retriever = HybridRetriever(
+                emb_model=self.config["rag"]["emb_model"],
+                cross_model=self.config["rag"]["cross_model"],
+                index_file=self.index_file,
+                context_file=self.context_file,
+                inform_dir=self.inform_dir,
+                chunk_size=self.config["rag"]["chunk_size"],
+                overlap=self.config["rag"]["overlap"],
+                top_k_title=self.config["rag"]["top_k_title"],
+                top_k_faiss=self.config["rag"]["top_k_faiss"],
+                top_k_final=self.config["rag"]["top_k_final"],
+                usage_tracker=self.usage_tracker,
+                logger=self.logger
+            )
+
+            self.lm = LMClient(
+                retriever=self.retriever,
+                data_dir=self.data_dir,
+                inform_dir=self.inform_dir,
+                logger=self.logger,
+                model_url=self.config["llm"]["model_url"],
+                model_name=self.config["llm"]["model_name"],
+                max_tokens=self.config["llm"]["max_tokens"],
+                max_chars=self.config["llm"]["max_chars"],
+                temperature=self.config["llm"]["temperature"],
+                timeout=self.config["llm"]["timeout"],
+                history_lim=self.config["llm"]["history_limit"]
+            )
+
+            self.telegram = TelegramPublisher(
+                self.config["telegram"]["bot_token"],
+                self.config["telegram"]["channel_id"],
+                logger=self.logger,
+                max_retries=self.config["telegram"]["retry_attempts"],
+                retry_delay=self.config["telegram"]["retry_delay"],
+                enable_preview=self.config["telegram"]["enable_preview"]
+            )
+
             # Проверка соединения с Telegram
             if not await self.telegram.check_connection():
                 raise TelegramError("Failed to connect to Telegram")
 
             self.logger.info("System initialized successfully")
             
-            # Очистка старых временных файлов
-            self.temp_manager.cleanup_old_files()
-            
             # Основной цикл обработки
             await self.process_topics()
 
+        except ConfigurationError as e:
+            self.logger.critical(f"Configuration error: {e}")
+            await self.notify_error(f"Configuration error: {e}")
+            sys.exit(1)
         except Exception as e:
-            self.logger.critical(f"System error: {e}")
-            # Попытка отправить уведомление об ошибке
-            try:
-                await self.telegram.send_text(f"🚨 Critical system error: {e}")
-            except:
-                pass
-            raise
+            self.logger.critical(f"Unexpected error: {e}")
+            await self.notify_error(f"Unexpected error: {e}")
+            sys.exit(1)
         finally:
-            # Сохранение состояния и очистка
+            # Сохранение статистики и очистка
             if hasattr(self, 'usage_tracker'):
                 self.usage_tracker.save_statistics()
-            self.state_manager.save_state()
-            self.temp_manager.cleanup_old_files()
+            
+            # Вывод итоговой статистики
+            stats = self.stats.to_dict()
+            self.logger.info("Final statistics:")
+            for key, value in stats.items():
+                self.logger.info(f"{key}: {value}")
+            
             self.logger.info("System shutdown complete")
 
-if __name__ == '__main__':
-    # Установка обработчика нераспознанных исключений
+def main():
+    """Точка входа с обработкой всех возможных ошибок"""
+    # Установка обработчика необработанных исключений
     def handle_exception(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
             sys.__excepthook__(exc_type, exc_value, exc_traceback)
             return
-        logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
-    
+        logging.error(
+            "Uncaught exception",
+            exc_info=(exc_type, exc_value, exc_traceback)
+        )
+
     sys.excepthook = handle_exception
     
     # Запуск системы
@@ -328,6 +482,9 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Fatal error: {e}")
         sys.exit(1)
+
+if __name__ == '__main__':
+    main()
 
 # код - logs.py
 

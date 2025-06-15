@@ -177,9 +177,17 @@ class RAGSystem:
                 self.stats.last_processing_time = (
                     datetime.now() - processing_start
                 ).total_seconds()
+            except ProcessingError as e:
+                error_msg = f"ProcessingError: {e}"
+                self.logger.error(error_msg, exc_info=True)
+                self.stats.failed_topics += 1
+                self.stats.last_error = error_msg
+                self.add_failed_topic(topic, error_msg)
+                await self.notify_error(error_msg)
+                await asyncio.sleep(5)
             except Exception as e:
-                error_msg = f"Error processing topic {topic}: {e}"
-                self.logger.error(error_msg)
+                error_msg = f"Unexpected error processing topic {topic}: {e}"
+                self.logger.critical(error_msg, exc_info=True)
                 self.stats.failed_topics += 1
                 self.stats.last_error = error_msg
                 self.add_failed_topic(topic, error_msg)
@@ -414,6 +422,7 @@ import logging
 import pandas as pd
 from bs4 import BeautifulSoup
 from logs import get_logger
+from utils.exceptions import FileOperationError
 
 # --- Централизованный логгер ---
 logger = get_logger("rag_file_utils")
@@ -462,15 +471,10 @@ def _smart_read_text(path: Path) -> str:
     return ""
 
 def extract_text_from_file(path: Path) -> str:
-    """
-    Универсальный парсер для извлечения текста из файлов различных форматов.
-    Поддерживает: txt, html, csv, xlsx, xlsm, docx, doc, pdf.
-    Возвращает текст или пустую строку при ошибке.
-    """
     ext = path.suffix.lower()
     if not path.exists():
         logger.error(f"Файл не найден: {path}")
-        return ""
+        raise FileOperationError(f"Файл не найден: {path}")
 
     try:
         if ext == ".txt":
@@ -555,8 +559,8 @@ def extract_text_from_file(path: Path) -> str:
             return f"[Неподдерживаемый тип файла: {ext}]"
 
     except Exception as e:
-        logger.error(f"Критическая ошибка при извлечении текста из {path}: {e}")
-        return ""
+        logger.error(f"Критическая ошибка при извлечении текста из {path}: {e}", exc_info=True)
+        raise FileOperationError(f"Критическая ошибка при извлечении текста из {path}: {e}") from e
 
 def clean_html_from_cell(cell_value) -> str:
     """
@@ -1213,18 +1217,26 @@ import requests
 import json
 from pathlib import Path
 from typing import Union, Optional, List
+from utils.exceptions import TelegramError
 import logging
 import time
 import html
+import traceback
 
-# Настройка логгера для этого модуля
-logger = logging.getLogger("rag_telegram")
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s [%(levelname)s] [rag_telegram] %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+def get_logger(name: str, logfile: Optional[Union[str, Path]] = None, level=logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if not logger.hasHandlers():
+        if logfile:
+            fh = logging.FileHandler(logfile, encoding="utf-8")
+            fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+            logger.addHandler(fh)
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        logger.addHandler(sh)
+        logger.setLevel(level)
+    return logger
+
+logger = get_logger("rag_telegram")
 
 def escape_html(text: str) -> str:
     """
@@ -1260,7 +1272,7 @@ class TelegramPublisher:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.enable_preview = enable_preview
-        self.logger = logger or logging.getLogger("rag_telegram")
+        self.logger = logger or get_logger("rag_telegram")
 
     def _post(self, method: str, data: dict, files: dict = None) -> dict:
         url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
@@ -1272,14 +1284,15 @@ class TelegramPublisher:
                 result = resp.json()
                 if not result.get("ok"):
                     self.logger.error(f"Telegram API error: {result}")
-                    raise Exception(f"Telegram API error: {result}")
+                    raise TelegramError(f"Telegram API error: {result}")
                 return result
             except Exception as e:
                 last_exc = e
-                self.logger.warning(f"Telegram API request failed (attempt {attempt}): {e}")
+                tb = traceback.format_exc()
+                self.logger.warning(f"Telegram API request failed (attempt {attempt}): {e}\n{tb}")
                 time.sleep(self.retry_delay)
         self.logger.error(f"Telegram API request failed after {self.max_retries} attempts: {last_exc}")
-        raise last_exc
+        raise TelegramError(f"Telegram API request failed after {self.max_retries} attempts: {last_exc}") from last_exc
 
     def send_text(
         self,
@@ -1295,7 +1308,6 @@ class TelegramPublisher:
         :param html_escape: экранировать HTML-спецсимволы (True по умолчанию)
         :return: message_id отправленного сообщения или None при ошибке
         """
-        # Экранирование HTML по требованию
         if html_escape and parse_mode == "HTML":
             text = escape_html(text)
         data = {
@@ -1313,7 +1325,7 @@ class TelegramPublisher:
             self.logger.info(f"Message posted to Telegram (id={msg_id})")
             return msg_id
         except Exception as e:
-            self.logger.error(f"Failed to send text message: {e}")
+            self.logger.error(f"Failed to send text message: {e}\n{traceback.format_exc()}")
             return None
 
     def send_photo(
@@ -1342,21 +1354,23 @@ class TelegramPublisher:
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
         files = {}
-        if isinstance(photo, (str, Path)) and Path(photo).exists():
-            files["photo"] = open(photo, "rb")
-        else:
-            data["photo"] = str(photo)
+        file_handle = None
         try:
+            if isinstance(photo, (str, Path)) and Path(photo).exists():
+                file_handle = open(photo, "rb")
+                files["photo"] = file_handle
+            else:
+                data["photo"] = str(photo)
             resp = self._post("sendPhoto", data, files)
             msg_id = resp.get("result", {}).get("message_id")
             self.logger.info(f"Photo posted to Telegram (id={msg_id})")
             return msg_id
         except Exception as e:
-            self.logger.error(f"Failed to send photo: {e}")
+            self.logger.error(f"Failed to send photo: {e}\n{traceback.format_exc()}")
             return None
         finally:
-            if files:
-                files["photo"].close()
+            if file_handle:
+                file_handle.close()
 
     def send_video(
         self,
@@ -1380,21 +1394,23 @@ class TelegramPublisher:
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
         files = {}
-        if isinstance(video, (str, Path)) and Path(video).exists():
-            files["video"] = open(video, "rb")
-        else:
-            data["video"] = str(video)
+        file_handle = None
         try:
+            if isinstance(video, (str, Path)) and Path(video).exists():
+                file_handle = open(video, "rb")
+                files["video"] = file_handle
+            else:
+                data["video"] = str(video)
             resp = self._post("sendVideo", data, files)
             msg_id = resp.get("result", {}).get("message_id")
             self.logger.info(f"Video posted to Telegram (id={msg_id})")
             return msg_id
         except Exception as e:
-            self.logger.error(f"Failed to send video: {e}")
+            self.logger.error(f"Failed to send video: {e}\n{traceback.format_exc()}")
             return None
         finally:
-            if files:
-                files["video"].close()
+            if file_handle:
+                file_handle.close()
 
     def send_audio(
         self,
@@ -1418,21 +1434,23 @@ class TelegramPublisher:
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
         files = {}
-        if isinstance(audio, (str, Path)) and Path(audio).exists():
-            files["audio"] = open(audio, "rb")
-        else:
-            data["audio"] = str(audio)
+        file_handle = None
         try:
+            if isinstance(audio, (str, Path)) and Path(audio).exists():
+                file_handle = open(audio, "rb")
+                files["audio"] = file_handle
+            else:
+                data["audio"] = str(audio)
             resp = self._post("sendAudio", data, files)
             msg_id = resp.get("result", {}).get("message_id")
             self.logger.info(f"Audio posted to Telegram (id={msg_id})")
             return msg_id
         except Exception as e:
-            self.logger.error(f"Failed to send audio: {e}")
+            self.logger.error(f"Failed to send audio: {e}\n{traceback.format_exc()}")
             return None
         finally:
-            if files:
-                files["audio"].close()
+            if file_handle:
+                file_handle.close()
 
     def send_document(
         self,
@@ -1459,21 +1477,23 @@ class TelegramPublisher:
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
         files = {}
-        if isinstance(document, (str, Path)) and Path(document).exists():
-            files["document"] = open(document, "rb")
-        else:
-            data["document"] = str(document)
+        file_handle = None
         try:
+            if isinstance(document, (str, Path)) and Path(document).exists():
+                file_handle = open(document, "rb")
+                files["document"] = file_handle
+            else:
+                data["document"] = str(document)
             resp = self._post("sendDocument", data, files)
             msg_id = resp.get("result", {}).get("message_id")
             self.logger.info(f"Document posted to Telegram (id={msg_id})")
             return msg_id
         except Exception as e:
-            self.logger.error(f"Failed to send document: {e}")
+            self.logger.error(f"Failed to send document: {e}\n{traceback.format_exc()}")
             return None
         finally:
-            if files:
-                files["document"].close()
+            if file_handle:
+                file_handle.close()
 
     def send_media_group(
         self,
@@ -1495,7 +1515,7 @@ class TelegramPublisher:
             self.logger.info(f"Media group posted to Telegram (messages={msg_ids})")
             return msg_ids
         except Exception as e:
-            self.logger.error(f"Failed to send media group: {e}")
+            self.logger.error(f"Failed to send media group: {e}\n{traceback.format_exc()}")
             return None
 
     def check_connection(self) -> bool:
@@ -1514,7 +1534,7 @@ class TelegramPublisher:
                 self.logger.error("Telegram bot connection failed")
                 return False
         except Exception as e:
-            self.logger.error(f"Telegram bot connection error: {e}")
+            self.logger.error(f"Telegram bot connection error: {e}\n{traceback.format_exc()}")
             return False
 
     def delayed_post(
@@ -2371,6 +2391,7 @@ import aiohttp
 from dataclasses import dataclass
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse, urljoin
+from utils.exceptions import ProcessingError, FileOperationError
 import time
 import hashlib
 
@@ -2410,81 +2431,58 @@ def is_safe_path(path: Path, allowed_dir: Path) -> bool:
 
 class DataIngestionManager:
     """Менеджер для загрузки данных из различных источников"""
-    
     def __init__(self, rag_pipeline: AdvancedRAGPipeline):
         self.rag = rag_pipeline
-    
+
     def load_from_text_file(self, filepath: str, encoding: str = 'utf-8') -> str:
-        """Загрузка текста из файла"""
         try:
             with open(filepath, 'r', encoding=encoding) as f:
                 return f.read()
         except Exception as e:
-            raise Exception(f"Ошибка чтения файла {filepath}: {e}")
-    
+            raise FileOperationError(f"Ошибка чтения файла {filepath}: {e}") from e
+
     def load_from_pdf(self, filepath: str) -> str:
-        """Загрузка текста из PDF файла"""
         if not PDF_AVAILABLE:
-            raise Exception("PyPDF2 не установлен. Установите: pip install PyPDF2")
-        
+            raise ProcessingError("PyPDF2 не установлен. Установите: pip install PyPDF2")
         try:
             text = ""
             with open(filepath, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
                 for page in reader.pages:
-                    text += page.extract_text() + "\n"
+                    text += (page.extract_text() or "") + "\n"
             return text
         except Exception as e:
-            raise Exception(f"Ошибка чтения PDF {filepath}: {e}")
-    
+            raise FileOperationError(f"Ошибка чтения PDF {filepath}: {e}") from e
+
     def load_from_docx(self, filepath: str) -> str:
-        """Загрузка текста из DOCX файла"""
         if not DOCX_AVAILABLE:
-            raise Exception("python-docx не установлен. Установите: pip install python-docx")
-        
+            raise ProcessingError("python-docx не установлен. Установите: pip install python-docx")
         try:
             doc = docx.Document(filepath)
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
+            text = "\n".join(paragraph.text for paragraph in doc.paragraphs)
             return text
         except Exception as e:
-            raise Exception(f"Ошибка чтения DOCX {filepath}: {e}")
-    
+            raise FileOperationError(f"Ошибка чтения DOCX {filepath}: {e}") from e
+
     def load_from_csv(self, filepath: str, text_columns: List[str]) -> List[Dict]:
-        """Загрузка данных из CSV файла"""
         try:
             documents = []
             with open(filepath, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for i, row in enumerate(reader):
-                    # Объединяем указанные колонки в один текст
-                    content_parts = []
-                    for col in text_columns:
-                        if col in row and row[col]:
-                            content_parts.append(str(row[col]))
-                    
+                    content_parts = [str(row[col]) for col in text_columns if col in row and row[col]]
                     if content_parts:
                         content = " ".join(content_parts)
-                        # Остальные колонки как метаданные
                         metadata = {k: v for k, v in row.items() if k not in text_columns}
-                        
-                        documents.append({
-                            'id': f"csv_row_{i}",
-                            'content': content,
-                            'metadata': metadata
-                        })
-            
+                        documents.append({'id': f"csv_row_{i}", 'content': content, 'metadata': metadata})
             return documents
         except Exception as e:
-            raise Exception(f"Ошибка чтения CSV {filepath}: {e}")
-    
+            raise FileOperationError(f"Ошибка чтения CSV {filepath}: {e}") from e
+
     def load_from_json(self, filepath: str, content_field: str, id_field: Optional[str] = None) -> List[Dict]:
-        """Загрузка данных из JSON файла"""
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
             documents = []
             if isinstance(data, list):
                 for i, item in enumerate(data):
@@ -2492,28 +2490,18 @@ class DataIngestionManager:
                         doc_id = item.get(id_field, f"json_item_{i}") if id_field else f"json_item_{i}"
                         content = str(item[content_field])
                         metadata = {k: v for k, v in item.items() if k not in [content_field, id_field]}
-                        
-                        documents.append({
-                            'id': doc_id,
-                            'content': content,
-                            'metadata': metadata
-                        })
-            
+                        documents.append({'id': doc_id, 'content': content, 'metadata': metadata})
             return documents
         except Exception as e:
-            raise Exception(f"Ошибка чтения JSON {filepath}: {e}")
-    
+            raise FileOperationError(f"Ошибка чтения JSON {filepath}: {e}") from e
+
     def load_from_url(self, url: str, timeout: int = 30) -> str:
-        """Загрузка контента с URL"""
         try:
             response = requests.get(url, timeout=timeout)
             response.raise_for_status()
-            
-            # Если это HTML, пытаемся извлечь текст
             if 'text/html' in response.headers.get('content-type', ''):
                 if BS4_AVAILABLE:
                     soup = BeautifulSoup(response.text, 'html.parser')
-                    # Удаляем script и style теги
                     for script in soup(["script", "style"]):
                         script.decompose()
                     return soup.get_text()
@@ -2521,12 +2509,10 @@ class DataIngestionManager:
                     return response.text
             else:
                 return response.text
-                
         except Exception as e:
-            raise Exception(f"Ошибка загрузки URL {url}: {e}")
-    
+            raise ProcessingError(f"Ошибка загрузки URL {url}: {e}") from e
+
     async def load_from_urls_async(self, urls: List[str], timeout: int = 30) -> List[Dict]:
-        """Асинхронная загрузка множества URL"""
         async def fetch_url(session, url):
             try:
                 async with session.get(url, timeout=timeout) as response:
@@ -2537,7 +2523,6 @@ class DataIngestionManager:
                             for script in soup(["script", "style"]):
                                 script.decompose()
                             content = soup.get_text()
-                    
                     return {
                         'id': hashlib.md5(url.encode()).hexdigest(),
                         'content': content,
@@ -2549,7 +2534,6 @@ class DataIngestionManager:
                     'content': "",
                     'metadata': {'source_url': url, 'status': 'error', 'error': str(e)}
                 }
-        
         async with aiohttp.ClientSession() as session:
             tasks = [fetch_url(session, url) for url in urls]
             results = await asyncio.gather(*tasks)
@@ -3137,6 +3121,7 @@ import requests
 import asyncio
 from pathlib import Path
 from typing import Optional, Callable, Any, Dict, List
+from utils.exceptions import ProcessingError, ModelError
 
 # ВАЖНО: enrich_context_with_tools и get_prompt_parts импортируются явно
 from rag_langchain_tools import enrich_context_with_tools
@@ -3177,10 +3162,6 @@ class LMClient:
         self.system_msg = system_msg or "Вы — эксперт по бровям и ресницам."
 
     async def generate(self, topic: str, uploadfile: Optional[str] = None) -> str:
-        """
-        Генерирует текст по теме с обогащением инструментами (интернет/калькулятор/таблица) при необходимости.
-        uploadfile: путь к прикреплённому файлу для Telegram-бота (или None).
-        """
         try:
             # 1. Получаем сырой контекст из RAG.
             ctx = self.retriever.retrieve(topic)
@@ -3260,22 +3241,18 @@ class LMClient:
                         self.logger.warning(f"Force truncating text from {len(text)} to {self.max_chars} chars")
                         return text[:self.max_chars-10] + "..."
                 except requests.exceptions.RequestException as e:
-                    self.logger.error(f"LM request error on attempt {attempt + 1}: {e}")
-                    # g) Уведомление о критических ошибках (например, через notify_admin)
+                    self.logger.error(f"LM request error on attempt {attempt + 1}: {e}", exc_info=True)
                     if attempt == self.max_attempts - 1:
-                        # self.notify_admin(f"LM request failed after all attempts: {e}")  # если есть notify_admin
-                        return "[Ошибка соединения с языковой моделью]"
+                        raise ModelError(f"LM request failed after all attempts: {e}") from e
                     await asyncio.sleep(5)
                 except Exception as e:
-                    self.logger.error(f"Unexpected error in generation attempt {attempt + 1}: {e}")
+                    self.logger.error(f"Unexpected error in generation attempt {attempt + 1}: {e}", exc_info=True)
                     if attempt == self.max_attempts - 1:
-                        # self.notify_admin(f"LM unexpected error after all attempts: {e}")
-                        return "[Ошибка генерации текста]"
-            return "[Ошибка: превышено количество попыток генерации]"
+                        raise ModelError(f"LM unexpected error after all attempts: {e}") from e
+            raise ModelError("Превышено количество попыток генерации")
         except Exception as e:
-            self.logger.error(f"Critical error in generate: {e}")
-            # self.notify_admin(f"Critical error in LMClient.generate: {e}")
-            return "[Критическая ошибка генерации]"
+            self.logger.error(f"Critical error in generate: {e}", exc_info=True)
+            raise ProcessingError(f"Critical error in LMClient.generate: {e}") from e
 
 # код - rag_langchain_tools.py
 

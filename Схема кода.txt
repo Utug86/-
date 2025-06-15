@@ -1,36 +1,47 @@
 project_root/
 │
-├── main.py                # Точка входа (предположительно)
-├── rag_file_utils.py
-├── rag_table_utils.py
-├── rag_text_utils.py
-├── rag_prompt_utils.py
-├── rag_lmclient.py        # Класс LMClient (генерация текста, взаимодействие с API)
-├── rag_langchain_tools.py # enrich_context_with_tools и др. тулзы
-├── rag_chunk_tracker.py
-├── rag_retriever.py
-├── rag_telegram.py
-├── RAG_Pipeline_Extensions_Utils.py
-├── logs.py
-├── search_utils.py
-├── media/                 # Только хранимые/отправляемые медиа-файлы
-│   ├── пока пусто, будет файл
-│   ├── пока пусто, будут папки с файлами
-│   └── ...
-├── config/      # папка с двумя файлами (допускается проработка
-│   ├── telegram_channel.txt  #id канала
-│   └── telegram_token.txt  #токен телеграм
-├── image_utils.py         # (будет создан) обработка изображений/медиа
+├── main.py                        # Точка входа, запуск RAG-системы
+├── logs.py                        # Логгер для всех модулей
+│
+├── rag_file_utils.py              # Извлечение и обработка текстов из файлов (txt, csv, docx, pdf и др.)
+├── rag_table_utils.py             # Обработка таблиц для RAG (csv, xlsx)
+├── rag_text_utils.py              # Работа с текстом: чанкинг, чтение с разными кодировками
+├── rag_prompt_utils.py            # Генерация промпта по шаблонам, подстановка переменных
+├── rag_lmclient.py                # LMClient: взаимодействие с LLM API (LM Studio)
+├── rag_langchain_tools.py         # Инструменты для обогащения контекста (web, calc, таблицы)
+├── rag_chunk_tracker.py           # Трекинг использования чанков знаний
+├── rag_retriever.py               # Гибридный retriever: FAISS + CrossEncoder, построение индексов
+├── rag_telegram.py                # Публикация сообщений/медиа в Telegram-канал
+├── image_utils.py                 # Работа с медиафайлами: выбор, валидация, ресайз, определение типа
+├── search_utils.py                # Альтернативная/расширяемая pipeline-логика, ChromaDB, batch-обработка
+├── RAG_Pipeline_Extensions_Utils.py # Data ingestion, web-интерфейс, аналитика, расширения
+│
+├── utils/
+│   ├── config_manager.py          # Менеджер конфигураций (json-файл)
+│   ├── state_manager.py           # Трекинг состояния: обработанные/ошибочные темы, статистика
+│   ├── exceptions.py              # Кастомные exception-классы
+│   └── path_utils.py              # Безопасная проверка путей файлов
+│
+├── config/                        # Конфиги (может быть больше двух файлов, все важные настройки)
+│   ├── telegram_channel.txt       # id канала Telegram
+│   ├── telegram_token.txt         # токен Telegram-бота
+│   └── config.json                # основной json-конфиг для всей системы
+│
+├── media/                         # Хранимые/отправляемые медиафайлы (jpg, png, pdf, docx, и др.)
+│   └── ...                        # могут быть вложенные папки с файлами
+│
 ├── data/
-│   ├── prompt_1/  # список txt файлов с разными названиями из первой части промта
+│   ├── prompt_1/                  # txt-шаблоны для первой части промпта
 │   │   └── ... (txt)
-│   ├── prompt_2/   # список txt файлов с разными названиями из второй части промта
+│   ├── prompt_2/                  # txt-шаблоны для второй части промпта
 │   │   └── ... (txt)
-│   ├── topics.txt  # список тем
-│   └── state.json (вместо processed_topics.txt) # список отработанных тем
-├── inform/
-│   └── ... (ваши .txt, .csv, .xlsx, .docx и т.п.)  # список файлов с полезной информацией для RAG системы
-└── requirements.txt
+│   ├── topics.txt                 # список тем, по одной на строку
+│   └── state.json                 # состояние: обработанные и неудачные темы, статистика
+│
+├── inform/                        # Файлы знаний для RAG (txt, html, doc, docx, csv, xlsx, pdf и др.)
+│   └── ... (любые поддерживаемые форматы)
+│
+└── requirements.txt               # requirements для запуска всей системы
 ```
 - В `data/topics.txt` — список тем, по одной на строку.
 - В `data/prompt_1/` и `data/prompt_2/` — ваши шаблоны промтов.

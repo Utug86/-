@@ -419,15 +419,16 @@ def get_logger(name: str, logfile: str = None, level=logging.INFO) -> logging.Lo
 
 from pathlib import Path
 import logging
+from typing import Optional
 import pandas as pd
 from bs4 import BeautifulSoup
-from logs import get_logger
-from utils.exceptions import FileOperationError
 
-# --- Централизованный логгер ---
+from logs import get_logger
+
 logger = get_logger("rag_file_utils")
 
-def _try_import_docx():
+# --- Dynamic imports ---
+def _try_import_docx() -> Optional[object]:
     try:
         import docx
         return docx
@@ -435,7 +436,7 @@ def _try_import_docx():
         logger.warning("python-docx не установлен. Форматы .docx будут проигнорированы.")
         return None
 
-def _try_import_pypdf2():
+def _try_import_pypdf2() -> Optional[object]:
     try:
         import PyPDF2
         return PyPDF2
@@ -443,7 +444,7 @@ def _try_import_pypdf2():
         logger.warning("PyPDF2 не установлен. Форматы .pdf будут проигнорированы.")
         return None
 
-def _try_import_textract():
+def _try_import_textract() -> Optional[object]:
     try:
         import textract
         return textract
@@ -455,12 +456,13 @@ DOCX = _try_import_docx()
 PDF = _try_import_pypdf2()
 TEXTRACT = _try_import_textract()
 
-# --- Кодировки для автоподбора ---
 COMMON_ENCODINGS = ["utf-8", "cp1251", "windows-1251", "latin-1", "iso-8859-1"]
+MAX_FILE_SIZE_MB = 100
 
 def _smart_read_text(path: Path) -> str:
     """
-    Читает текстовый файл, пробуя несколько популярных кодировок.
+    Пробует прочитать текстовый файл с помощью популярных кодировок.
+    Возвращает содержимое файла или пустую строку при ошибке.
     """
     for encoding in COMMON_ENCODINGS:
         try:
@@ -471,10 +473,19 @@ def _smart_read_text(path: Path) -> str:
     return ""
 
 def extract_text_from_file(path: Path) -> str:
+    """
+    Универсальный парсер для извлечения текста из файлов различных форматов.
+    Поддерживает: txt, html, csv, xlsx, xlsm, docx, doc, pdf.
+    Возвращает текст или специальную метку при ошибке/неподдерживаемом формате.
+    """
     ext = path.suffix.lower()
     if not path.exists():
         logger.error(f"Файл не найден: {path}")
-        raise FileOperationError(f"Файл не найден: {path}")
+        return "[Файл не найден]"
+
+    if path.stat().st_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        logger.warning(f"Файл слишком большой (> {MAX_FILE_SIZE_MB} МБ): {path}")
+        return "[Файл слишком большой для обработки]"
 
     try:
         if ext == ".txt":
@@ -503,7 +514,7 @@ def extract_text_from_file(path: Path) -> str:
                 return df.to_csv(sep="\t", index=False)
             except Exception as e:
                 logger.error(f"Ошибка чтения Excel через pandas: {e}")
-                return ""
+                return "[Ошибка чтения Excel]"
 
         elif ext == ".docx":
             logger.info(f"Extracting text from DOCX file: {path}")
@@ -513,10 +524,10 @@ def extract_text_from_file(path: Path) -> str:
                     return "\n".join([p.text for p in doc.paragraphs])
                 except Exception as e:
                     logger.error(f"Ошибка чтения DOCX: {e}")
-                    return ""
+                    return "[Ошибка чтения DOCX]"
             else:
                 logger.warning(f"Модуль python-docx не установлен. DOCX не поддерживается.")
-                return ""
+                return "[Формат DOCX не поддерживается]"
 
         elif ext == ".doc":
             logger.info(f"Extracting text from DOC file: {path}")
@@ -525,14 +536,13 @@ def extract_text_from_file(path: Path) -> str:
                     return TEXTRACT.process(str(path)).decode("utf-8", errors="ignore")
                 except Exception as e:
                     logger.error(f"Ошибка чтения DOC через textract: {e}")
-                    return ""
+                    return "[Ошибка чтения DOC]"
             else:
                 logger.warning(f"textract не установлен. DOC не поддерживается.")
-                return ""
+                return "[Формат DOC не поддерживается]"
 
         elif ext == ".pdf":
             logger.info(f"Extracting text from PDF file: {path}")
-            # Предпочтение PyPDF2, затем textract
             if PDF is not None:
                 try:
                     text = []
@@ -550,17 +560,17 @@ def extract_text_from_file(path: Path) -> str:
                     return TEXTRACT.process(str(path)).decode("utf-8", errors="ignore")
                 except Exception as e:
                     logger.error(f"Ошибка чтения PDF через textract: {e}")
-                    return ""
+                    return "[Ошибка чтения PDF]"
             logger.warning(f"PyPDF2 и textract не установлены. PDF не поддерживается.")
-            return ""
+            return "[Формат PDF не поддерживается]"
 
         else:
             logger.warning(f"Неподдерживаемый тип файла: {path}")
             return f"[Неподдерживаемый тип файла: {ext}]"
 
     except Exception as e:
-        logger.error(f"Критическая ошибка при извлечении текста из {path}: {e}", exc_info=True)
-        raise FileOperationError(f"Критическая ошибка при извлечении текста из {path}: {e}") from e
+        logger.error(f"Критическая ошибка при извлечении текста из {path}: {e}")
+        return "[Критическая ошибка при извлечении текста]"
 
 def clean_html_from_cell(cell_value) -> str:
     """
@@ -833,22 +843,25 @@ class ChunkUsageTracker:
 import faiss
 import numpy as np
 import json
+import shutil
 from pathlib import Path
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import hashlib
 import logging
 import datetime
-import itertools
 
-from rag_utils import extract_text_from_file
+from rag_file_utils import extract_text_from_file
 
-def notify_admin(message: str):
-    # Пример: отправка email/лог/другой системы оповещения
+def notify_admin(message: str) -> None:
     logging.warning(f"[ADMIN NOTIFY] {message}")
 
 class HybridRetriever:
-    INDEX_VERSION = "1.2"  # Обновлено: семантическая дедупликация и доп. обработка текста
+    """
+    Гибридный ретривер: поиск релевантных чанков по FAISS-индексу и кросс-энкодеру.
+    Гарантирует валидацию индекса, atomic запись, резервное копирование, обработку edge-cases.
+    """
+    INDEX_VERSION = "1.2"
 
     def __init__(
         self,
@@ -863,7 +876,7 @@ class HybridRetriever:
         top_k_faiss: int,
         top_k_final: int,
         usage_tracker,
-        logger
+        logger: logging.Logger
     ):
         self.emb_model = emb_model
         self.cross_model = cross_model
@@ -880,13 +893,13 @@ class HybridRetriever:
 
         self.sentencemodel = SentenceTransformer(self.emb_model)
         self.crossencoder = CrossEncoder(self.cross_model)
-        self.faiss_index = None
-        self.metadata = None
-        self.index_metadata = {}
+        self.faiss_index: Optional[faiss.Index] = None
+        self.metadata: Optional[List[Dict[str, Any]]] = None
+        self.index_metadata: Dict[str, Any] = {}
 
         self._try_load_or_build_indices()
 
-    def _get_index_signature(self):
+    def _get_index_signature(self) -> str:
         conf = {
             "version": self.INDEX_VERSION,
             "emb_model": self.emb_model,
@@ -904,7 +917,7 @@ class HybridRetriever:
         files = sorted([(str(f), f.stat().st_mtime) for f in directory.iterdir() if f.is_file()])
         return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
 
-    def _try_load_or_build_indices(self):
+    def _try_load_or_build_indices(self) -> None:
         self.logger.info("Initializing HybridRetriever...")
         rebuild_needed = False
         if self.index_file.exists() and self.context_file.exists():
@@ -913,12 +926,12 @@ class HybridRetriever:
                 idx_sig = self.index_metadata.get("index_signature")
                 expected_sig = self._get_index_signature()
                 if idx_sig != expected_sig:
-                    self.logger.warning("Index signature mismatch (model/chunking/config changed). Rebuilding index...")
-                    notify_admin("HybridRetriever: Index signature mismatch, forced rebuild triggered.")
+                    self.logger.warning("Index signature mismatch. Rebuilding index...")
+                    notify_admin("HybridRetriever: Index signature mismatch, rebuild triggered.")
                     rebuild_needed = True
             except Exception as e:
                 self.logger.warning(f"Failed to load indices: {e}. Rebuilding...")
-                notify_admin(f"HybridRetriever: Failed to load indices: {e}. Forced rebuild triggered.")
+                notify_admin(f"HybridRetriever: Failed to load indices: {e}. Rebuilding.")
                 rebuild_needed = True
         else:
             self.logger.info("No existing indices found. Building new ones...")
@@ -926,47 +939,42 @@ class HybridRetriever:
         if rebuild_needed:
             self._build_indices()
 
-    def _load_indices(self):
+    def _load_indices(self) -> None:
         self.logger.info("Loading indices...")
         try:
             with open(self.context_file, 'r', encoding='utf-8') as f:
                 context_json = json.load(f)
-                if isinstance(context_json, dict) and "metadata" in context_json:
-                    self.metadata = context_json["metadata"]
-                    self.index_metadata = context_json.get("index_metadata", {})
-                else:
-                    self.metadata = context_json
-                    self.index_metadata = {}
+            if not isinstance(context_json, dict) or "metadata" not in context_json:
+                raise ValueError("context_file missing 'metadata' field")
+            self.metadata = context_json["metadata"]
+            self.index_metadata = context_json.get("index_metadata", {})
             if not isinstance(self.metadata, list) or len(self.metadata) == 0:
                 raise ValueError("Metadata must be a non-empty list")
-            sample = self.metadata[0]
-            required_fields = ['title', 'chunk']
-            if not all(field in sample for field in required_fields):
-                raise ValueError(f"Metadata must contain fields: {required_fields}")
+            # Ensure fields exist
             for item in self.metadata:
-                if 'tokens' not in item:
-                    item['tokens'] = item['chunk'].split()
-                if isinstance(item['tokens'], str):
-                    item['tokens'] = item['tokens'].split()
-                if 'created_at' not in item:
-                    item['created_at'] = None
-                if 'source' not in item:
-                    item['source'] = None
+                item.setdefault('tokens', item['chunk'].split())
+                item.setdefault('created_at', None)
+                item.setdefault('source', None)
             self.faiss_index = faiss.read_index(str(self.index_file))
+            # Validate dimension
+            sample_chunk = self.metadata[0]['chunk']
+            emb_sample = self.sentencemodel.encode([sample_chunk], convert_to_tensor=False, normalize_embeddings=True)
+            if self.faiss_index.d != emb_sample.shape[1]:
+                self.logger.critical(
+                    f"Embedding dimension mismatch: FAISS index {self.faiss_index.d}, model {emb_sample.shape[1]}"
+                )
+                notify_admin("HybridRetriever: Embedding dimension mismatch, index rebuild required")
+                raise RuntimeError("Embedding dimension mismatch — rebuild index!")
             self.logger.info(f"Loaded {len(self.metadata)} chunks")
             self.logger.info(f"Index metadata: {self.index_metadata}")
         except Exception as e:
-            self.logger.error(f"Error loading indices: {e}")
+            self.logger.critical(f"Error loading indices: {e}")
             notify_admin(f"HybridRetriever: Error loading indices: {e}")
             raise
 
     def _normalize_text(self, text: str) -> str:
         """
-        Более сложная нормализация текста:
-        - Удаление лишних пробелов и пустых строк
-        - Приведение к нижнему регистру
-        - Удаление html-тегов (если есть)
-        - Удаление специальных символов, кроме базовых знаков препинания
+        Базовая нормализация текста (html → plain, lower, clean).
         """
         import re
         from bs4 import BeautifulSoup
@@ -974,15 +982,17 @@ class HybridRetriever:
         text = text.lower()
         text = re.sub(r'\s+', ' ', text)
         text = re.sub(r'[^а-яa-z0-9\s\.,:;!\?\(\)\[\]\'\"-]', '', text)
-        text = text.strip()
-        return text
+        return text.strip()
 
-    def _semantic_deduplicate(self, chunks: List[Dict], threshold: float = 0.91) -> List[Dict]:
+    def _semantic_deduplicate(self, chunks: List[Dict[str, Any]], threshold: float = 0.91) -> List[Dict[str, Any]]:
         """
-        Семантическая дедупликация: сравниваем эмбеддинги чанков, удаляем дубли на основе cosine similarity.
-        threshold: если cosine similarity > threshold, считаем дублирующим.
+        Семантическая дедупликация: удаление дубликатов по cosine similarity эмбеддингов.
+        Для больших коллекций (N>10000) пропускается.
         """
         if len(chunks) < 2:
+            return chunks
+        if len(chunks) > 10000:
+            self.logger.warning("Skipping semantic deduplication due to excessive collection size")
             return chunks
         texts = [c['chunk'] for c in chunks]
         embs = self.sentencemodel.encode(texts, convert_to_tensor=False, show_progress_bar=False, normalize_embeddings=True)
@@ -993,25 +1003,24 @@ class HybridRetriever:
             if i in already_used:
                 continue
             to_keep.append(chunks[i])
-            for j in range(i+1, len(chunks)):
+            for j in range(i + 1, len(chunks)):
                 if j in already_used:
                     continue
                 sim = np.dot(embs[i], embs[j])
                 if sim > threshold:
                     already_used.add(j)
-        deduped = to_keep
-        self.logger.info(f"Semantic deduplication: {len(chunks)} → {len(deduped)} unique chunks (threshold={threshold})")
-        return deduped
+        self.logger.info(f"Semantic deduplication: {len(chunks)} → {len(to_keep)} unique chunks (threshold={threshold})")
+        return to_keep
 
-    def _build_indices(self):
+    def _build_indices(self) -> None:
         self.logger.info("Building new indices...")
         metadata = []
         inform_files = [f for f in self.inform_dir.iterdir()
                         if f.suffix.lower() in [".txt", ".html", ".csv", ".xlsx", ".xlsm", ".doc", ".docx", ".pdf"]]
         if not inform_files:
-            notify_admin(f"HybridRetriever: No suitable files found in {self.inform_dir}")
-            raise RuntimeError(f"No suitable files found in {self.inform_dir}")
-        self.logger.info(f"Found {len(inform_files)} files to process in inform")
+            notify_admin(f"HybridRetriever: No suitable files in {self.inform_dir}")
+            raise RuntimeError(f"No suitable files in {self.inform_dir}")
+        self.logger.info(f"Found {len(inform_files)} files to process")
         index_time = datetime.datetime.utcnow().isoformat()
         for file in inform_files:
             try:
@@ -1020,7 +1029,6 @@ class HybridRetriever:
                 if not text or not text.strip():
                     self.logger.warning(f"Empty or unreadable file: {file}")
                     continue
-                # Сложная нормализация текста
                 text = self._normalize_text(text)
                 words = text.split()
                 chunks = []
@@ -1029,40 +1037,45 @@ class HybridRetriever:
                     if len(chunk.strip()) < 10:
                         continue
                     tokens = chunk.split()
-                    # Базовая дедупликация на уровне строк
                     if any(chunk == m['chunk'] for m in chunks):
                         continue
                     chunks.append({'title': title, 'chunk': chunk, 'tokens': tokens,
                                    'created_at': index_time, 'source': str(file)})
                 if not chunks:
                     continue
-                # Семантическая дедупликация на уровне чанков из одного файла
                 deduped_chunks = self._semantic_deduplicate(chunks, threshold=0.91)
                 metadata.extend(deduped_chunks)
                 self.logger.info(f"Processed {file.name}: {len(words)} words -> {len(deduped_chunks)} unique chunks")
             except Exception as e:
                 self.logger.error(f"Error processing file {file}: {e}")
                 notify_admin(f"HybridRetriever: Error processing file {file}: {e}")
-                continue
         if not metadata:
             notify_admin("HybridRetriever: No valid chunks created from files")
             raise RuntimeError("No valid chunks created from files")
-        # Семантическая дедупликация глобально (по всем файлам)
         metadata = self._semantic_deduplicate(metadata, threshold=0.91)
         self.logger.info(f"Total unique chunks after global deduplication: {len(metadata)}")
         try:
+            # Backup before overwrite
+            if self.index_file.exists():
+                shutil.copy2(self.index_file, self.index_file.with_suffix('.bak'))
+            if self.context_file.exists():
+                shutil.copy2(self.context_file, self.context_file.with_suffix('.bak'))
             texts = [f"{m['title']}: {m['chunk']}" for m in metadata]
             self.logger.info("Generating embeddings...")
             embs = self.sentencemodel.encode(texts, convert_to_tensor=False, show_progress_bar=True, batch_size=32, normalize_embeddings=True)
             embs = np.asarray(embs, dtype='float32')
             dim = embs.shape[1]
             if len(metadata) > 10000:
-                self.logger.info("Large dataset detected. Using HNSW index for scalability.")
-                self.faiss_index = faiss.IndexHNSWFlat(dim, 32)
+                self.logger.info("Large dataset: using HNSW index.")
+                faiss_index = faiss.IndexHNSWFlat(dim, 32)
             else:
-                self.faiss_index = faiss.IndexFlatL2(dim)
-            self.faiss_index.add(embs)
-            faiss.write_index(self.faiss_index, str(self.index_file))
+                faiss_index = faiss.IndexFlatL2(dim)
+            faiss_index.add(embs)
+            # Atomic write
+            tmp_index = self.index_file.with_suffix('.tmp')
+            faiss.write_index(faiss_index, str(tmp_index))
+            tmp_index.replace(self.index_file)
+            self.faiss_index = faiss_index
             self.index_metadata = {
                 "index_signature": self._get_index_signature(),
                 "version": self.INDEX_VERSION,
@@ -1078,31 +1091,44 @@ class HybridRetriever:
                 "metadata": metadata,
                 "index_metadata": self.index_metadata
             }
-            with open(self.context_file, 'w', encoding='utf-8') as f:
+            tmp_context = self.context_file.with_suffix('.tmp')
+            with open(tmp_context, 'w', encoding='utf-8') as f:
                 json.dump(context_json, f, ensure_ascii=False, indent=2)
+            tmp_context.replace(self.context_file)
             self.metadata = metadata
             self.logger.info(f"Indices built and saved: {len(metadata)} unique chunks, index type: {type(self.faiss_index)}")
             self.logger.info(f"Index metadata: {self.index_metadata}")
-            notify_admin(f"HybridRetriever: Index successfully rebuilt. {len(metadata)} unique chunks.")
+            notify_admin(f"HybridRetriever: Index rebuilt. {len(metadata)} unique chunks.")
         except Exception as e:
             self.logger.error(f"Error building or saving indices: {e}")
             notify_admin(f"HybridRetriever: Error building index: {e}")
             raise
 
-    def retrieve(self, query: str, return_chunks: bool = False) -> str:
+    def retrieve(self, query: str, return_chunks: bool = False) -> Union[str, List[Dict[str, Any]]]:
+        """
+        Возвращает релевантный контекст (или чанки) по запросу.
+        :param query: Запрос пользователя
+        :param return_chunks: Если True, возвращает список чанков, иначе — строку
+        """
         self.logger.info(f"Retrieving context for query: '{query}'")
         if self.faiss_index is None or self.metadata is None or len(self.metadata) == 0:
             self.logger.error("Index not loaded or metadata is empty")
             notify_admin("HybridRetriever: Retrieval failed — index not loaded or metadata is empty")
-            return ""
+            return "" if not return_chunks else []
         query_emb = self.sentencemodel.encode([query], convert_to_tensor=False, normalize_embeddings=True)
         query_emb = np.asarray(query_emb, dtype='float32')
+        if self.faiss_index.d != query_emb.shape[1]:
+            self.logger.critical(
+                f"Embedding dimension mismatch: FAISS index {self.faiss_index.d}, query_emb {query_emb.shape[1]}"
+            )
+            notify_admin("HybridRetriever: Embedding dimension mismatch, index rebuild required")
+            raise RuntimeError("Embedding dimension mismatch — rebuild index!")
         D, I = self.faiss_index.search(query_emb, self.top_k_faiss)
         I = I[0]
         D = D[0]
         if not len(I):
             self.logger.warning("No relevant chunks found in index")
-            return ""
+            return "" if not return_chunks else []
         candidates = []
         for idx, dist in zip(I, D):
             if idx < 0 or idx >= len(self.metadata):
@@ -1111,7 +1137,8 @@ class HybridRetriever:
             meta['faiss_dist'] = float(dist)
             candidates.append(meta)
         for c in candidates:
-            c['usage_penalty'] = self.usage_tracker.get_penalty(c['chunk']) if self.usage_tracker else 0.0
+            c['usage_penalty'] = self.usage_tracker.get_usage_penalty(
+                c['chunk'], c['title']) if self.usage_tracker else 0.0
         candidates.sort(key=lambda x: (x['faiss_dist'] + x['usage_penalty']))
         rerank_candidates = candidates[:self.top_k_final * 2]
         ce_scores = []
@@ -1139,11 +1166,12 @@ class HybridRetriever:
                 titles.add(c['title'])
         result = "\n\n".join([f"[{c['title']}] {c['chunk']}" for c in selected])
         self.logger.info(f"Retrieved {len(selected)} chunks from index for query '{query}'")
-        if return_chunks:
-            return selected
-        return result
+        return selected if return_chunks else result
 
     def get_index_stats(self) -> Dict[str, Any]:
+        """
+        Возвращает статистику по индексу.
+        """
         stats = {
             "num_chunks": len(self.metadata) if self.metadata else 0,
             "num_files": len(set(m['source'] for m in self.metadata)) if self.metadata else 0,
@@ -1154,7 +1182,10 @@ class HybridRetriever:
         self.logger.info(f"Index stats: {stats}")
         return stats
 
-    def rebuild_index(self):
+    def rebuild_index(self) -> None:
+        """
+        Принудительное перестроение индекса (с backup).
+        """
         self.logger.info("Manual index rebuild triggered...")
         notify_admin("Manual HybridRetriever index rebuild triggered by user.")
         self._build_indices()
@@ -1989,10 +2020,11 @@ if __name__ == "__main__":
 
 import random
 from pathlib import Path
-from typing import Optional, Tuple, List, Set
+from typing import Optional, Tuple, List, Set, Union
 from PIL import Image, UnidentifiedImageError
 import logging
 import mimetypes
+from enum import Enum, auto
 
 logger = logging.getLogger("image_utils")
 if not logger.hasHandlers():
@@ -2010,13 +2042,40 @@ SUPPORTED_MEDIA_EXTS: Set[str] = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS | S
 MAX_IMAGE_SIZE: Tuple[int, int] = (1280, 1280)
 MAX_FILE_SIZE_MB: int = 50
 
+class MediaValidationStatus(Enum):
+    OK = auto()
+    NOT_FOUND = auto()
+    SYMLINK = auto()
+    OUT_OF_DIR = auto()
+    NOT_SUPPORTED = auto()
+    TOO_LARGE = auto()
+    CANNOT_OPEN = auto()
+    UNKNOWN = auto()
+
+class MediaValidationResult:
+    def __init__(self, valid: bool, status: MediaValidationStatus, path: Optional[Path], message: str = ""):
+        self.valid = valid
+        self.status = status
+        self.path = path
+        self.message = message
+
+    def __bool__(self):
+        return self.valid
+
+    def __repr__(self):
+        return f"<MediaValidationResult status={self.status} path={self.path} msg={self.message}>"
+
 def is_safe_media_path(path: Path, media_dir: Path) -> bool:
-    """Путь должен быть строго внутри media_dir. Защита от directory traversal."""
+    """
+    Проверяет, что path лежит строго внутри media_dir.
+    Защита от directory traversal.
+    """
     try:
+        # Python >=3.9
         return path.resolve().is_relative_to(media_dir.resolve())
     except AttributeError:  # Python <3.9
         try:
-            return str(media_dir.resolve()) in str(path.resolve().parents) or path.resolve() == media_dir.resolve()
+            return str(path.resolve().as_posix()).startswith(media_dir.resolve().as_posix() + "/")
         except Exception as e:
             logger.error(f"Ошибка проверки пути: {e}")
             return False
@@ -2024,16 +2083,30 @@ def is_safe_media_path(path: Path, media_dir: Path) -> bool:
         logger.error(f"Ошибка проверки пути: {e}")
         return False
 
-def pick_random_media_file(media_dir: Path, allowed_exts: Optional[Set[str]] = None) -> Optional[Path]:
-    """Случайно выбирает файл из media_dir (рекурсивно) с поддерживаемым расширением."""
+def pick_random_media_file(media_dir: Path, allowed_exts: Optional[Set[str]] = None, max_retries: int = 5) -> Optional[Path]:
+    """
+    Случайно выбирает валидный файл из media_dir (рекурсивно) с поддерживаемым расширением.
+    Делает max_retries попыток выбрать валидный файл.
+    """
     allowed_exts = allowed_exts or SUPPORTED_MEDIA_EXTS
     files = [f for f in media_dir.rglob("*") if f.is_file() and f.suffix.lower() in allowed_exts]
     if not files:
         logger.warning(f"Нет файлов с поддерживаемыми расширениями в {media_dir}")
         return None
-    return random.choice(files)
+    attempt = 0
+    while attempt < max_retries and files:
+        file = random.choice(files)
+        result = validate_media_file(file, media_dir)
+        if result.valid:
+            return file
+        else:
+            logger.info(f"Пропущен невалидный файл при попытке выбора: {file} ({result.status})")
+            files.remove(file)
+            attempt += 1
+    logger.warning("Не удалось выбрать валидный файл после повторных попыток.")
+    return None
 
-def validate_media_file(path: Path, media_dir: Path = Path("media")) -> Tuple[bool, str]:
+def validate_media_file(path: Path, media_dir: Path = Path("media")) -> MediaValidationResult:
     """
     Проверяет валидность файла:
     - В media_dir
@@ -2044,27 +2117,28 @@ def validate_media_file(path: Path, media_dir: Path = Path("media")) -> Tuple[bo
     """
     if not path.exists():
         logger.error(f"Файл не найден: {path}")
-        return False, "Файл не найден"
+        return MediaValidationResult(False, MediaValidationStatus.NOT_FOUND, path, "Файл не найден")
     if path.is_symlink():
         logger.error(f"Файл является symlink: {path}")
-        return False, "Файл является symlink"
+        return MediaValidationResult(False, MediaValidationStatus.SYMLINK, path, "Файл является symlink")
     if not is_safe_media_path(path, media_dir):
         logger.error(f"Файл вне папки media: {path}")
-        return False, "Файл вне папки media"
+        return MediaValidationResult(False, MediaValidationStatus.OUT_OF_DIR, path, "Файл вне папки media")
     if path.suffix.lower() not in SUPPORTED_MEDIA_EXTS:
         logger.error(f"Неподдерживаемый формат: {path.suffix} ({path})")
-        return False, f"Неподдерживаемый формат: {path.suffix}"
+        return MediaValidationResult(False, MediaValidationStatus.NOT_SUPPORTED, path, f"Неподдерживаемый формат: {path.suffix}")
     if path.stat().st_size > MAX_FILE_SIZE_MB * 1024 * 1024:
         logger.error(f"Файл слишком большой (> {MAX_FILE_SIZE_MB} МБ): {path}")
-        return False, f"Файл слишком большой (>{MAX_FILE_SIZE_MB} МБ)"
-    # MIME check (дополнительно)
+        return MediaValidationResult(False, MediaValidationStatus.TOO_LARGE, path, f"Файл слишком большой (>{MAX_FILE_SIZE_MB} МБ)")
     mime, _ = mimetypes.guess_type(str(path))
     if mime is None:
         logger.warning(f"Не удалось определить MIME-тип: {path}")
-    return True, "OK"
+    return MediaValidationResult(True, MediaValidationStatus.OK, path, "OK")
 
 def get_media_type(path: Path) -> str:
-    """Определяет тип файла по расширению."""
+    """
+    Определяет тип файла по расширению.
+    """
     ext = path.suffix.lower()
     if ext in SUPPORTED_IMAGE_EXTS:
         return "image"
@@ -2077,7 +2151,9 @@ def get_media_type(path: Path) -> str:
     return "unknown"
 
 def process_image(path: Path, output_dir: Optional[Path] = None, max_size: Tuple[int, int] = MAX_IMAGE_SIZE) -> Optional[Path]:
-    """Уменьшает изображение до max_size, если требуется. Возвращает путь к новому файлу."""
+    """
+    Уменьшает изображение до max_size, если требуется. Возвращает путь к новому файлу.
+    """
     try:
         with Image.open(path) as img:
             if img.size[0] <= max_size[0] and img.size[1] <= max_size[1]:
@@ -2097,19 +2173,23 @@ def process_image(path: Path, output_dir: Optional[Path] = None, max_size: Tuple
         return None
 
 def get_all_media_files(media_dir: Path, allowed_exts: Optional[Set[str]] = None) -> List[Path]:
-    """Список всех файлов в media_dir c поддерживаемыми расширениями."""
+    """
+    Список всех файлов в media_dir c поддерживаемыми расширениями.
+    """
     allowed_exts = allowed_exts or SUPPORTED_MEDIA_EXTS
     return [f for f in media_dir.rglob("*") if f.is_file() and f.suffix.lower() in allowed_exts]
 
 def prepare_media_for_post(media_dir: Path = Path("media")) -> Optional[Path]:
-    """Выбирает и валидирует случайный медиа-файл. При необходимости уменьшает изображение."""
+    """
+    Выбирает и валидирует случайный медиа-файл. При необходимости уменьшает изображение.
+    """
     file = pick_random_media_file(media_dir)
     if not file:
         logger.warning("Не найден ни один подходящий медиа-файл для публикации.")
         return None
-    is_valid, reason = validate_media_file(file, media_dir)
-    if not is_valid:
-        logger.error(f"Медиа-файл не прошёл валидацию: {file}. Причина: {reason}")
+    result = validate_media_file(file, media_dir)
+    if not result.valid:
+        logger.error(f"Медиа-файл не прошёл валидацию: {file}. Причина: {result.status} ({result.message})")
         return None
     media_type = get_media_type(file)
     if media_type == "image":
@@ -2133,14 +2213,17 @@ from logs import get_logger
 
 logger = get_logger("rag_text_utils")
 
-# Популярные кодировки для автоподбора
 COMMON_ENCODINGS = ["utf-8", "cp1251", "windows-1251", "latin-1", "iso-8859-1"]
+MAX_FILE_SIZE_MB = 50
 
 def _smart_read_text(path: Path) -> str:
     """
     Пробует прочитать текстовый файл с помощью популярных кодировок.
     Возвращает содержимое файла или выбрасывает UnicodeDecodeError, если не удалось.
     """
+    if path.stat().st_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        logger.error(f"Файл слишком большой (> {MAX_FILE_SIZE_MB} МБ): {path}")
+        raise IOError(f"File too large: {path}")
     for encoding in COMMON_ENCODINGS:
         try:
             return path.read_text(encoding=encoding)
@@ -2157,15 +2240,6 @@ def chunk_text(
 ) -> List[str]:
     """
     Делит строку на чанки по словам с заданным размером и overlap.
-
-    Args:
-        text (str): Входной текст.
-        chunk_size (int): Количество слов в чанке.
-        overlap (int): Пересечение слов между чанками.
-        max_chunks (int, optional): Максимальное количество чанков (обрезка).
-
-    Returns:
-        List[str]: Чанки текста.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size должен быть положительным")
@@ -2178,7 +2252,7 @@ def chunk_text(
     step = max(chunk_size - overlap, 1)
     for i in range(0, len(words), step):
         chunk = " ".join(words[i:i+chunk_size])
-        if chunk:
+        if chunk.strip():  # отбрасываем пустые чанки
             chunks.append(chunk)
         if max_chunks is not None and len(chunks) >= max_chunks:
             logger.info(f"Обрезано по max_chunks={max_chunks}")
@@ -2194,16 +2268,6 @@ def process_text_file_for_rag(
 ) -> List[str]:
     """
     Читает текстовый файл и делит его на чанки для RAG.
-
-    Args:
-        file_path (Path): Путь к файлу.
-        chunk_size (int): Количество слов в чанке.
-        overlap (int): Пересечение слов между чанками.
-        max_chunks (int, optional): Максимум чанков, если нужно ограничить память.
-        raise_on_error (bool): Если True, выбрасывает исключение при ошибке, иначе возвращает [].
-
-    Returns:
-        List[str]: Список чанков (может быть пустым при ошибке).
     """
     try:
         text = _smart_read_text(file_path)
@@ -2224,15 +2288,6 @@ def process_text_for_rag(
 ) -> List[str]:
     """
     Делит произвольную строку на чанки для RAG.
-
-    Args:
-        text (str): Входной текст.
-        chunk_size (int): Количество слов в чанке.
-        overlap (int): Пересечение слов между чанками.
-        max_chunks (int, optional): Максимум чанков.
-
-    Returns:
-        List[str]: Чанки текста.
     """
     try:
         chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
@@ -2247,10 +2302,36 @@ def process_text_for_rag(
 # код - rag_prompt_utils.py
 
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Any
 from logs import get_logger
+import random
+import re
 
 logger = get_logger("rag_prompt_utils")
+
+class PromptTemplateCache:
+    _cache: Dict[str, str] = {}
+    @classmethod
+    def get(cls, path: Path) -> Optional[str]:
+        key = str(path.resolve())
+        if key in cls._cache:
+            return cls._cache[key]
+        if not path.exists():
+            logger.warning(f"Шаблон промпта не найден: {path}")
+            return None
+        try:
+            text = path.read_text(encoding="utf-8")
+            cls._cache[key] = text
+            return text
+        except Exception as e:
+            logger.error(f"Ошибка чтения шаблона: {path}: {e}")
+            return None
+
+def safe_format(template: str, variables: Dict[str, Any]) -> str:
+    def repl(match):
+        var = match.group(1)
+        return str(variables.get(var, f"{{{var}}}"))
+    return re.sub(r"\{(\w+)\}", repl, template)
 
 def get_prompt_parts(
     data_dir: Union[str, Path],
@@ -2258,31 +2339,19 @@ def get_prompt_parts(
     context: str,
     uploadfile: Optional[Union[str, Path]] = None,
     file1: Optional[Union[str, Path]] = None,
-    file2: Optional[Union[str, Path]] = None
+    file2: Optional[Union[str, Path]] = None,
+    extra_vars: Optional[Dict[str, Any]] = None,
+    max_context_len_upload: int = 1024,
+    max_context_len_no_upload: int = 4096,
+    max_prompt_len: int = 8192,
 ) -> str:
     """
     Составляет промпт для LLM на основе шаблонов и переданных параметров.
-
-    Args:
-        data_dir (Union[str, Path]): Путь к директории с шаблонами prompt_1, prompt_2, prompt.txt.
-        topic (str): Тематика запроса (подставляется в {TOPIC}).
-        context (str): Контекст запроса (подставляется в {CONTEXT}).
-        uploadfile (Optional[Union[str, Path]]): Путь или имя файла, если требуется подстановка в {UPLOADFILE}.
-        file1 (Optional[Union[str, Path]]): Явный путь к первому файлу шаблона (если нужен детерминированный шаблон).
-        file2 (Optional[Union[str, Path]]): Явный путь ко второму файлу шаблона.
-
-    Returns:
-        str: Готовый промпт для LLM с подставленными значениями.
-    
-    Поддерживаемые плейсхолдеры в шаблонах:
-        - {TOPIC}: тематика запроса
-        - {CONTEXT}: текстовый контекст
-        - {UPLOADFILE}: имя файла/статус файла (см. uploadfile)
-        - (Могут быть добавлены дополнительные, например {USER}, {DATE}, {EXTRA}, если потребуется в будущем)
+    Условия:
+      - {TOPIC}: каждая строка из topics.txt, подставляется отдельно
+      - {CONTEXT}: весь материал из RAG+интернета, лимит 4096 или 1024 если есть {UPLOADFILE}
+      - {UPLOADFILE}: имя рандомного файла из media или статус ошибки
     """
-    import random
-
-    # Приведение путей к Path для безопасности
     data_dir = Path(data_dir)
     if file1 is not None:
         file1 = Path(file1)
@@ -2296,27 +2365,23 @@ def get_prompt_parts(
     # Проверка существования data_dir
     if not data_dir.exists() or not data_dir.is_dir():
         logger.error(f"data_dir '{data_dir}' не существует или не является директорией")
-        return f"{topic}\n\n{context}"
+        return f"{topic}\n\n{context[:max_context_len_no_upload]}"
 
     def read_template(path: Path) -> Optional[str]:
-        try:
-            return path.read_text(encoding="utf-8")
-        except Exception as e:
-            logger.error(f"Ошибка чтения шаблона промпта {path}: {e}")
-            return None
+        return PromptTemplateCache.get(path)
 
     prompt1_dir = data_dir / "prompt_1"
     prompt2_dir = data_dir / "prompt_2"
     template = None
 
-    # Детерминированный шаблон по явно заданным файлам
+    # Детерминированный шаблон
     if file1 is not None and file2 is not None and file1.exists() and file2.exists():
         logger.info(f"Детерминированный шаблон: {file1.name} + {file2.name}")
         txt1 = read_template(file1)
         txt2 = read_template(file2)
         if txt1 is not None and txt2 is not None:
             template = txt1 + "\n" + txt2
-    # Случайные шаблоны из prompt_1 и prompt_2
+    # Случайные шаблоны
     elif prompt1_dir.exists() and prompt2_dir.exists():
         prompt1_files = list(prompt1_dir.glob("*.txt"))
         prompt2_files = list(prompt2_dir.glob("*.txt"))
@@ -2329,7 +2394,7 @@ def get_prompt_parts(
             if txt1 is not None and txt2 is not None:
                 template = txt1 + "\n" + txt2
 
-    # Fallback на prompt.txt
+    # Fallback
     if template is None:
         prompt_file = data_dir / "prompt.txt"
         if prompt_file.exists():
@@ -2337,44 +2402,44 @@ def get_prompt_parts(
             template = read_template(prompt_file)
         else:
             logger.warning("Fallback на plain topic + context")
-            return f"{topic}\n\n{context}"
+            return f"{topic}\n\n{context[:max_context_len_no_upload]}"
 
-    if template is None:
-        logger.error("Ни один шаблон не удалось прочитать, возврат plain topic + context")
-        return f"{topic}\n\n{context}"
+    if template is None or not template.strip():
+        logger.error("Шаблон пустой или не удалось прочитать, возврат plain topic + context")
+        return f"{topic}\n\n{context[:max_context_len_no_upload]}"
 
-    # Определение наличия плейсхолдера {UPLOADFILE}
+    # Определяем лимит context
     has_uploadfile = "{UPLOADFILE}" in template
+    if has_uploadfile:
+        context = context[:max_context_len_upload]
+    else:
+        context = context[:max_context_len_no_upload]
 
-    uploadfile_text = ""
+    # Формируем переменные для шаблона
+    variables = {
+        "TOPIC": topic,
+        "CONTEXT": context,
+    }
+    if extra_vars:
+        variables.update(extra_vars)
+    # uploadfile logic
     if has_uploadfile:
         if uploadfile_path is not None:
             try:
                 if uploadfile_path.exists():
-                    uploadfile_text = uploadfile_path.name
-                    context = context[:1024]
+                    variables["UPLOADFILE"] = uploadfile_path.name
                 else:
-                    uploadfile_text = f"[Файл не найден: {uploadfile_path.name}]"
+                    variables["UPLOADFILE"] = f"[Файл не найден: {uploadfile_path.name}]"
             except Exception as e:
-                uploadfile_text = "[Ошибка с файлом]"
+                variables["UPLOADFILE"] = "[Ошибка с файлом]"
                 logger.error(f"Ошибка обработки uploadfile: {e}")
         else:
-            uploadfile_text = "[Файл не передан]"
+            variables["UPLOADFILE"] = "[Файл не передан]"
 
-    if not has_uploadfile:
-        context = context[:4096]
-
-    # Подстановка плейсхолдеров
-    prompt_out = (
-        template.replace("{TOPIC}", topic)
-                .replace("{CONTEXT}", context)
-    )
-    if has_uploadfile:
-        prompt_out = prompt_out.replace("{UPLOADFILE}", uploadfile_text)
-    # Возможность расширения: автоматическая подстановка будущих плейсхолдеров
-    # Например:
-    # for placeholder, value in extra_placeholders.items():
-    #     prompt_out = prompt_out.replace(f"{{{placeholder}}}", value)
+    prompt_out = safe_format(template, variables).strip()
+    if len(prompt_out) > max_prompt_len:
+        logger.warning(f"Промпт превышает лимит {max_prompt_len}, будет обрезан.")
+        prompt_out = prompt_out[:max_prompt_len-10] + "..."
     return prompt_out
 
 
@@ -2838,24 +2903,31 @@ class RAGBenchmarking:
 # код - rag_lmclient.py
 
 import re
-import requests
+import aiohttp
 import asyncio
 from pathlib import Path
-from typing import Optional, Callable, Any, Dict, List
-from utils.exceptions import ProcessingError, ModelError
+from typing import Optional, Any, Dict, List, Union
+import logging
 
-# ВАЖНО: enrich_context_with_tools и get_prompt_parts импортируются явно
 from rag_langchain_tools import enrich_context_with_tools
-from rag_utils import get_prompt_parts
+from rag_prompt_utils import get_prompt_parts
+
+class LMClientException(Exception):
+    """Базовое исключение LLM клиента."""
+    pass
 
 class LMClient:
+    """
+    Асинхронный клиент для генерации текстов через LLM API.
+    Гарантирует асинхронность, контроль длины, SRP, устойчивость к ошибкам.
+    """
+
     def __init__(
         self,
-        retriever,
-        data_dir,
-        inform_dir,
-        logger,
-        # a) Все параметры генерации — теперь явные, с дефолтами или обязательные
+        retriever: Any,
+        data_dir: Union[str, Path],
+        inform_dir: Union[str, Path],
+        logger: logging.Logger,
         model_url: str,
         model_name: str,
         max_tokens: int = 1024,
@@ -2879,102 +2951,145 @@ class LMClient:
         self.temperature = temperature
         self.timeout = timeout
         self.history_lim = history_lim
-        # b) system_msg теперь параметр, дефолтная роль — если не указано
         self.system_msg = system_msg or "Вы — эксперт по бровям и ресницам."
 
-    async def generate(self, topic: str, uploadfile: Optional[str] = None) -> str:
+    async def generate(
+        self, 
+        topic: str, 
+        uploadfile: Optional[str] = None
+    ) -> str:
+        """
+        Генерирует текст по теме с использованием контекста и инструментов.
+        :param topic: Тема для генерации
+        :param uploadfile: путь к прикреплённому файлу (если нужен в prompt)
+        :return: Ответ LLM (или строка с ошибкой)
+        """
         try:
-            # 1. Получаем сырой контекст из RAG.
-            ctx = self.retriever.retrieve(topic)
-
-            # 2. Обогащаем контекст инструментами, если это нужно.
-            ctx = enrich_context_with_tools(topic, ctx, self.inform_dir)
-
-            # 3. Генерируем промт (случайная сборка prompt_1/prompt_2 или fallback на prompt.txt)
-            try:
-                user_text = get_prompt_parts(self.data_dir, topic, ctx, uploadfile=uploadfile)
-            except Exception as e:
-                self.logger.error(f"Ошибка генерации промта из prompt_1/prompt_2: {e}")
-                prompt_file = self.data_dir / 'prompt.txt'
-                if not prompt_file.exists():
-                    self.logger.error(f"Prompt file not found: {prompt_file}")
-                    return "[Ошибка: файл промпта не найден]"
-                prompt_template = prompt_file.read_text(encoding='utf-8')
-                user_text = prompt_template.replace('{TOPIC}', topic).replace('{CONTEXT}', ctx)
-
-            # b) system message — теперь параметр, не захардкожен
-            system_msg = {"role": "system", "content": self.system_msg}
-            user_msg = {"role": "user", "content": user_text}
-            messages = [system_msg, user_msg]
-
-            for attempt in range(self.max_attempts):
-                try:
-                    self.logger.info(f"Generation attempt {attempt + 1} for topic: {topic}")
-                    resp = requests.post(
-                        self.model_url,
-                        json={
-                            "model": self.model_name,
-                            "messages": messages,
-                            "temperature": self.temperature,
-                            "max_tokens": self.max_tokens
-                        },
-                        timeout=self.timeout
-                    )
-                    resp.raise_for_status()
-                    response_data = resp.json()
-                    if 'choices' not in response_data or not response_data['choices']:
-                        self.logger.error("Invalid LM response format")
-                        continue
-                    text = response_data['choices'][0]['message']['content'].strip()
-
-                    # f) Форматирование: убираем markdown-заголовки, разделители, промо-тексты, ссылки
-                    text = re.sub(r"(?m)^#{2,}.*$", "", text)  # markdown-заголовки
-                    text = re.sub(r"(?m)^---+", "", text)      # разделители
-                    text = re.sub(r"\[\[.*?\]\]\(.*?\)", "", text)  # markdown-ссылки вида [[1]](url)
-                    text = re.sub(r"\n{2,}", "\n", text)       # множественные переводы строк
-                    # Удаляем явные фразы LLM ("As an AI language model", "Я искусственный интеллект" и т.п.)
-                    text = re.sub(
-                        r"(as an ai language model|i am an ai language model|я искусственный интеллект|как искусственный интеллект)[\.,]?\s*",
-                        "",
-                        text, flags=re.IGNORECASE
-                    )
-                    text = text.strip()
-
-                    if len(text) <= self.max_chars:
-                        self.logger.info(f"Generated text length: {len(text)} chars")
-                        return text
-                    # e) Улучшенная логика истории сообщений
-                    if attempt < self.max_attempts - 1:
-                        messages.append({"role": "assistant", "content": text})
-                        messages.append({
-                            "role": "user",
-                            "content": f"Текст слишком длинный ({len(text)}>{self.max_chars}), сократи до {self.max_chars} символов."
-                        })
-                        sysm, rest = messages[0], messages[1:]
-                        # Берем последние self.history_lim*2 сообщений (user/assistant), не нарушая структуру
-                        last_msgs = []
-                        for m in reversed(rest):
-                            if len(last_msgs) >= self.history_lim * 2:
-                                break
-                            last_msgs.insert(0, m)
-                        messages = [sysm] + last_msgs
-                    else:
-                        self.logger.warning(f"Force truncating text from {len(text)} to {self.max_chars} chars")
-                        return text[:self.max_chars-10] + "..."
-                except requests.exceptions.RequestException as e:
-                    self.logger.error(f"LM request error on attempt {attempt + 1}: {e}", exc_info=True)
-                    if attempt == self.max_attempts - 1:
-                        raise ModelError(f"LM request failed after all attempts: {e}") from e
-                    await asyncio.sleep(5)
-                except Exception as e:
-                    self.logger.error(f"Unexpected error in generation attempt {attempt + 1}: {e}", exc_info=True)
-                    if attempt == self.max_attempts - 1:
-                        raise ModelError(f"LM unexpected error after all attempts: {e}") from e
-            raise ModelError("Превышено количество попыток генерации")
+            context = await self._get_full_context(topic)
+            prompt = self._build_prompt(topic, context, uploadfile)
+            return await self._request_llm_with_retries(topic, prompt)
         except Exception as e:
-            self.logger.error(f"Critical error in generate: {e}", exc_info=True)
-            raise ProcessingError(f"Critical error in LMClient.generate: {e}") from e
+            self.logger.error(f"Critical error in generate: {e}")
+            return "[Критическая ошибка генерации]"
 
+    async def _get_full_context(self, topic: str) -> str:
+        """
+        Получает и обогащает контекст по теме.
+        """
+        try:
+            ctx = self.retriever.retrieve(topic)
+            ctx = enrich_context_with_tools(topic, ctx, self.inform_dir)
+            return ctx
+        except Exception as e:
+            self.logger.warning(f"Ошибка получения/обогащения контекста: {e}")
+            return ""
+
+    def _build_prompt(
+        self, 
+        topic: str, 
+        context: str, 
+        uploadfile: Optional[str] = None
+    ) -> str:
+        """
+        Генерирует промпт для LLM.
+        """
+        try:
+            return get_prompt_parts(self.data_dir, topic, context, uploadfile=uploadfile)
+        except Exception as e:
+            self.logger.error(f"Ошибка генерации промпта: {e}")
+            prompt_file = self.data_dir / 'prompt.txt'
+            if prompt_file.exists():
+                prompt_template = prompt_file.read_text(encoding='utf-8')
+                return prompt_template.replace('{TOPIC}', topic).replace('{CONTEXT}', context)
+            else:
+                return f"{topic}\n\n{context}"
+
+    async def _request_llm_with_retries(self, topic: str, prompt: str) -> str:
+        """
+        Выполняет несколько попыток генерации текста через LLM API с контролем длины и истории.
+        """
+        messages = [
+            {"role": "system", "content": self.system_msg},
+            {"role": "user", "content": prompt}
+        ]
+        for attempt in range(self.max_attempts):
+            try:
+                text = await self._request_llm(messages)
+                text = self._postprocess(text)
+                if len(text) <= self.max_chars:
+                    self.logger.info(f"Generated text length: {len(text)} chars")
+                    return text
+                # Если слишком длинно — добавить в историю и просить сжать
+                if attempt < self.max_attempts - 1:
+                    messages = self._update_history(messages, text)
+                else:
+                    self.logger.warning(f"Force truncating text from {len(text)} to {self.max_chars} chars")
+                    return text[:self.max_chars-10] + "..."
+            except asyncio.TimeoutError as e:
+                self.logger.error(f"Timeout in attempt {attempt+1}: {e}")
+            except Exception as e:
+                self.logger.error(f"LLM request error in attempt {attempt+1}: {e}")
+            await asyncio.sleep(2)
+        return "[Ошибка: превышено количество попыток генерации]"
+
+    async def _request_llm(self, messages: List[Dict[str, str]]) -> str:
+        """
+        Асинхронно отправляет запрос к LLM API и получает результат.
+        """
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens
+        }
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(self.model_url, json=payload) as resp:
+                if resp.status != 200:
+                    raise LMClientException(f"LLM API error: HTTP {resp.status}")
+                data = await resp.json()
+                if 'choices' not in data or not data['choices']:
+                    raise LMClientException("Invalid LLM response format")
+                return data['choices'][0]['message']['content'].strip()
+
+    def _postprocess(self, text: str) -> str:
+        """
+        Удаляет markdown-заголовки, разделители, мусор LLM из ответа.
+        """
+        rules = [
+            (r"(?m)^#{2,}.*$", ""),        # markdown-заголовки
+            (r"(?m)^---+", ""),            # разделители
+            (r"\[\[.*?\]\]\(.*?\)", ""),   # markdown-ссылки
+            (r"\n{2,}", "\n"),             # множественные переводы строк
+            (r"(as an ai language model|i am an ai language model|я искусственный интеллект|как искусственный интеллект)[\.,]?\s*", "", re.IGNORECASE)
+        ]
+        for rule in rules:
+            if len(rule) == 2:
+                text = re.sub(rule[0], rule[1], text)
+            else:
+                text = re.sub(rule[0], rule[1], text, flags=rule[2])
+        return text.strip()
+
+    def _update_history(self, messages: List[Dict[str, str]], text: str) -> List[Dict[str, str]]:
+        """
+        Обновляет историю сообщений для запроса к LLM (ограничивает по self.history_lim).
+        """
+        # Добавляем assistant/user
+        history = messages[:]
+        history.append({"role": "assistant", "content": text})
+        history.append({
+            "role": "user",
+            "content": f"Текст слишком длинный ({len(text)}>{self.max_chars}), сократи до {self.max_chars} символов."
+        })
+        sysm, rest = history[0], history[1:]
+        # Берём последние пары user/assistant (history_lim*2), не нарушая структуру
+        last_msgs = []
+        for m in reversed(rest):
+            if len(last_msgs) >= self.history_lim * 2:
+                break
+            last_msgs.insert(0, m)
+        return [sysm] + last_msgs
+    
 # код - rag_langchain_tools.py
 
 import logging
@@ -2982,8 +3097,6 @@ from rag_utils import web_search, safe_eval, analyze_table
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-# Причина: Внедрение логгирования для прозрачности и отладки интеллектуального слоя,
-# а также для согласованности с остальной системой.
 logger = logging.getLogger("rag_langchain_tools")
 if not logger.hasHandlers():
     handler = logging.StreamHandler()
@@ -2992,7 +3105,6 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-# Ключевые слова для инструментов (расширяемый конфиг)
 TOOL_KEYWORDS = {
     "web": ["найди", "поиск", "интернет", "lookup", "search", "google", "bing", "duckduckgo"],
     "calc": ["выгод", "посчит", "calculate", "profit", "выбери", "сколько", "рассчитай"],
@@ -3000,6 +3112,9 @@ TOOL_KEYWORDS = {
 }
 
 def tool_internet_search(query: str, num_results: int = 8) -> str:
+    """
+    Выполняет интернет-поиск по запросу.
+    """
     logger.info(f"Вызов интернет-поиска по запросу: {query}")
     results = web_search(query, num_results=num_results)
     if not results:
@@ -3008,6 +3123,9 @@ def tool_internet_search(query: str, num_results: int = 8) -> str:
     return "\n".join(results)
 
 def tool_calculator(expr: str, variables: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Выполняет безопасный расчет выражения.
+    """
     logger.info(f"Вызов калькулятора с выражением: {expr}")
     try:
         return str(safe_eval(expr, variables=variables))
@@ -3022,6 +3140,9 @@ def tool_table_analysis(
     max_rows: int = 18,
     max_cols: int = 10
 ) -> str:
+    """
+    Анализирует таблицу по запросу.
+    """
     logger.info(f"Анализ таблицы: {table_filename}")
     try:
         file_path = Path(inform_dir) / table_filename
@@ -3048,7 +3169,6 @@ def smart_tool_selector(
     results = []
     used_tools = []
 
-    # Причина: поддержка сложных сценариев — одновременный вызов нескольких инструментов, если встречаются разные ключевые слова.
     # Сначала web search
     if any(x in topic_lc for x in tool_keywords["web"]):
         logger.info("[smart_tool_selector] Web search triggered")
@@ -3104,15 +3224,22 @@ def enrich_context_with_tools(
 # код - utils/config_manager.py
 from pathlib import Path
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 import logging
-from utils.exceptions import ConfigurationError
 
 class ConfigManager:
+    """
+    Менеджер конфигурации для всей системы.
+    Гарантирует загрузку, валидацию и выдачу параметров с проверкой на ошибки.
+    """
+
     def __init__(self, config_path: Path):
+        """
+        :param config_path: Путь к json-файлу конфигурации
+        """
         self.config_path = config_path
         self.logger = logging.getLogger("config_manager")
-        self.config = self._load_config()
+        self.config: Dict[str, Any] = self._load_config()
         self._validate_config()
 
     def _load_config(self) -> Dict[str, Any]:
@@ -3122,77 +3249,87 @@ class ConfigManager:
                 return json.load(f)
         except Exception as e:
             self.logger.critical(f"Failed to load configuration: {e}")
-            raise ConfigurationError(f"Failed to load configuration: {e}") from e
+            raise
 
-    def _validate_config(self):
+    def _validate_config(self) -> None:
         """Валидация конфигурации"""
         required_sections = ['telegram', 'language_model', 'retrieval', 'system', 'paths']
         for section in required_sections:
             if section not in self.config:
-                raise ConfigurationError(f"Missing required config section: {section}")
+                raise ValueError(f"Missing required config section: {section}")
 
     def get_telegram_config(self) -> Dict[str, Any]:
         """
-        Получение конфигурации Telegram-бота (с безопасной загрузкой токена и channel_id из файлов).
-        :raises ConfigurationError: если не удаётся загрузить токен/ID или файлы отсутствуют.
+        Получение и проверка конфигурации Telegram.
+        :return: словарь с ключами 'bot_token', 'channel_id' и настройками Telegram
+        :raises: ValueError, если файлы токена или channel_id не найдены
         """
         config = self.config['telegram'].copy()
         try:
             token_file = Path(config['bot_token_file'])
             channel_file = Path(config['channel_id_file'])
 
-            if not token_file.is_file():
-                self.logger.critical(f"Telegram token file not found: {token_file}")
-                raise ConfigurationError(f"Telegram token file not found: {token_file}")
-            if not channel_file.is_file():
-                self.logger.critical(f"Channel ID file not found: {channel_file}")
-                raise ConfigurationError(f"Channel ID file not found: {channel_file}")
+            if not token_file.exists():
+                raise ValueError(f"Telegram token file not found: {token_file}")
+            if not channel_file.exists():
+                raise ValueError(f"Channel ID file not found: {channel_file}")
 
             config['bot_token'] = token_file.read_text(encoding='utf-8').strip()
             config['channel_id'] = channel_file.read_text(encoding='utf-8').strip()
-
-            if not config['bot_token']:
-                self.logger.critical("Telegram bot token is empty after reading file!")
-                raise ConfigurationError("Telegram bot token is empty!")
-            if not config['channel_id']:
-                self.logger.critical("Telegram channel_id is empty after reading file!")
-                raise ConfigurationError("Telegram channel_id is empty!")
-            return config
-
         except Exception as e:
             self.logger.critical(f"Failed to load Telegram credentials: {e}")
-            raise ConfigurationError(f"Failed to load Telegram credentials: {e}") from e
+            raise
+        return config
 
     def get_llm_config(self) -> Dict[str, Any]:
+        """Получение настроек LLM"""
         return self.config['language_model']
 
     def get_retrieval_config(self) -> Dict[str, Any]:
+        """Получение retrieval-конфига"""
         return self.config['retrieval']
 
     def get_system_config(self) -> Dict[str, Any]:
+        """Получение системных параметров"""
         return self.config['system']
 
     def get_path(self, path_key: str) -> Path:
+        """
+        Получение пути из конфигурации.
+        :param path_key: Ключ из секции 'paths'
+        :return: Path-объект
+        :raises KeyError: если ключ не найден
+        """
         if path_key not in self.config['paths']:
-            raise ConfigurationError(f"Path not found in config: {path_key}")
+            raise KeyError(f"Path not found in config: {path_key}")
         return Path(self.config['paths'][path_key])
 
     def get(self, section: str, key: str, default: Any = None) -> Any:
+        """
+        Получение значения по секции и ключу.
+        :param section: Имя секции (str)
+        :param key: Имя ключа (str)
+        :param default: Значение по умолчанию
+        """
         return self.config.get(section, {}).get(key, default)
 
-    def update(self, section: str, key: str, value: Any):
+    def update(self, section: str, key: str, value: Any) -> None:
+        """
+        Обновление значения в конфиге с сохранением в файл.
+        """
         if section not in self.config:
             self.config[section] = {}
         self.config[section][key] = value
         self._save_config()
 
-    def _save_config(self):
+    def _save_config(self) -> None:
+        """Сохранение конфигурации в файл"""
         try:
             with open(self.config_path, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=4, ensure_ascii=False)
         except Exception as e:
             self.logger.error(f"Failed to save configuration: {e}")
-            raise ConfigurationError(f"Failed to save configuration: {e}") from e
+            raise
 
 # код -  utils/exceptions.py
 class RAGException(Exception):
@@ -3227,47 +3364,45 @@ class FileOperationError(RAGException):
 # код - utils/state_manager.py
 from pathlib import Path
 import json
-from typing import Dict, Any, Set
+from typing import Dict, Any, Set, Optional
 from datetime import datetime
 import logging
-from utils.exceptions import FileOperationError
-from filelock import FileLock, Timeout
 
 class StateManager:
+    """
+    Менеджер состояния обработки тем.
+    Сохраняет прогресс (обработанные и неудачные темы), статистику, поддерживает recoverability.
+    """
+
     def __init__(self, state_file: Path):
+        """
+        :param state_file: Путь к JSON-файлу состояния.
+        """
         self.state_file = state_file
         self.logger = logging.getLogger("state_manager")
-        self.lock_file = self.state_file.with_suffix(".lock")
         self.state: Dict[str, Any] = self._load_state()
 
     def _load_state(self) -> Dict[str, Any]:
-        """Загрузка состояния из файла (с автоматическим приведением processed_topics к set)"""
+        """Загрузка состояния из файла или создание по умолчанию."""
         if self.state_file.exists():
             try:
-                with FileLock(str(self.lock_file), timeout=10):
-                    with open(self.state_file, 'r', encoding='utf-8') as f:
-                        state = json.load(f)
-                # processed_topics всегда приводим к set
-                if "processed_topics" in state:
-                    state["processed_topics"] = set(state["processed_topics"])
-                else:
-                    state["processed_topics"] = set()
-                if "failed_topics" not in state:
-                    state["failed_topics"] = {}
-                if "statistics" not in state:
-                    state["statistics"] = {
-                        "total_processed": 0,
-                        "successful": 0,
-                        "failed": 0
-                    }
-                return state
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # Преобразуем processed_topics к set для быстрого поиска
+                    if isinstance(data.get("processed_topics"), list):
+                        data["processed_topics"] = set(data["processed_topics"])
+                    elif isinstance(data.get("processed_topics"), set):
+                        pass
+                    else:
+                        data["processed_topics"] = set()
+                    return data
             except Exception as e:
                 self.logger.error(f"Failed to load state: {e}")
                 return self._create_default_state()
         return self._create_default_state()
 
     def _create_default_state(self) -> Dict[str, Any]:
-        """Создание состояния по умолчанию"""
+        """Создание состояния по умолчанию."""
         return {
             "last_update": datetime.utcnow().isoformat(),
             "processed_topics": set(),
@@ -3279,33 +3414,30 @@ class StateManager:
             }
         }
 
-    def save_state(self):
-        """Сохранение состояния (атомарно, с file lock)"""
+    def save_state(self) -> None:
+        """Сохранение состояния (atomic)."""
         try:
-            with FileLock(str(self.lock_file), timeout=10):
-                # Конвертируем set в list для JSON
-                state_copy = self.state.copy()
-                state_copy["processed_topics"] = list(self.state["processed_topics"])
-                state_copy["last_update"] = datetime.utcnow().isoformat()
-                tmp_file = self.state_file.with_suffix('.tmp')
-                with open(tmp_file, 'w', encoding='utf-8') as f:
-                    json.dump(state_copy, f, indent=4, ensure_ascii=False)
-                tmp_file.replace(self.state_file)
+            state_copy = self.state.copy()
+            # Сериализуем set как list для JSON
+            state_copy["processed_topics"] = list(self.state["processed_topics"])
+            state_copy["last_update"] = datetime.utcnow().isoformat()
+            tmp_file = self.state_file.with_suffix('.tmp')
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(state_copy, f, indent=4, ensure_ascii=False)
+            tmp_file.replace(self.state_file)
         except Exception as e:
             self.logger.error(f"Failed to save state: {e}")
-            raise FileOperationError(f"Failed to save state: {e}")
+            raise
 
-    def add_processed_topic(self, topic: str):
-        """Добавление обработанной темы (гарантия типа set)"""
-        if not isinstance(self.state["processed_topics"], set):
-            self.state["processed_topics"] = set(self.state["processed_topics"])
+    def add_processed_topic(self, topic: str) -> None:
+        """Добавить обработанную тему."""
         self.state["processed_topics"].add(topic)
         self.state["statistics"]["total_processed"] += 1
         self.state["statistics"]["successful"] += 1
         self.save_state()
 
-    def add_failed_topic(self, topic: str, error: str):
-        """Добавление темы с ошибкой"""
+    def add_failed_topic(self, topic: str, error: str) -> None:
+        """Добавить тему с ошибкой."""
         self.state["failed_topics"][topic] = {
             "error": error,
             "timestamp": datetime.utcnow().isoformat(),
@@ -3315,21 +3447,19 @@ class StateManager:
         self.save_state()
 
     def get_processed_topics(self) -> Set[str]:
-        """Получение списка обработанных тем (set всегда)"""
-        if not isinstance(self.state["processed_topics"], set):
-            self.state["processed_topics"] = set(self.state["processed_topics"])
+        """Получить множество обработанных тем."""
         return self.state["processed_topics"]
 
     def get_failed_topics(self) -> Dict[str, Dict[str, Any]]:
-        """Получение списка тем с ошибками"""
+        """Получить dict тем с ошибками."""
         return self.state["failed_topics"]
 
     def get_statistics(self) -> Dict[str, int]:
-        """Получение статистики"""
+        """Получить статистику обработки."""
         return self.state["statistics"]
 
-    def clear_failed_topics(self):
-        """Очистка списка тем с ошибками"""
+    def clear_failed_topics(self) -> None:
+        """Очистить список тем с ошибками."""
         self.state["failed_topics"].clear()
         self.save_state()
 

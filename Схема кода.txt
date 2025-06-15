@@ -1,0 +1,37 @@
+project_root/
+│
+├── main.py                # Точка входа (предположительно)
+├── rag_file_utils.py
+├── rag_table_utils.py
+├── rag_text_utils.py
+├── rag_prompt_utils.py
+├── rag_lmclient.py        # Класс LMClient (генерация текста, взаимодействие с API)
+├── rag_langchain_tools.py # enrich_context_with_tools и др. тулзы
+├── rag_chunk_tracker.py
+├── rag_retriever.py
+├── rag_telegram.py
+├── RAG_Pipeline_Extensions_Utils.py
+├── logs.py
+├── search_utils.py
+├── media/                 # Только хранимые/отправляемые медиа-файлы
+│   ├── пока пусто, будет файл
+│   ├── пока пусто, будут папки с файлами
+│   └── ...
+├── config/      # папка с двумя файлами (допускается проработка
+│   ├── telegram_channel.txt  #id канала
+│   └── telegram_token.txt  #токен телеграм
+├── image_utils.py         # (будет создан) обработка изображений/медиа
+├── data/
+│   ├── prompt_1/  # список txt файлов с разными названиями из первой части промта
+│   │   └── ... (txt)
+│   ├── prompt_2/   # список txt файлов с разными названиями из второй части промта
+│   │   └── ... (txt)
+│   ├── topics.txt  # список тем
+│   └── state.json (вместо processed_topics.txt) # список отработанных тем
+├── inform/
+│   └── ... (ваши .txt, .csv, .xlsx, .docx и т.п.)  # список файлов с полезной информацией для RAG системы
+└── requirements.txt
+```
+- В `data/topics.txt` — список тем, по одной на строку.
+- В `data/prompt_1/` и `data/prompt_2/` — ваши шаблоны промтов.
+- В `inform/` — ваши файлы знаний (поддерживаются: txt, html, docx, doc, csv, xlsx).

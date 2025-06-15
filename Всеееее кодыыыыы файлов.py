@@ -1969,62 +1969,82 @@ if __name__ == "__main__":
 
 import random
 from pathlib import Path
-from typing import Optional, Tuple, List
-
+from typing import Optional, Tuple, List, Set
 from PIL import Image, UnidentifiedImageError
+import logging
+import mimetypes
 
-# --- Поддерживаемые форматы Telegram ---
-SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".mkv"}
-SUPPORTED_DOC_EXTS   = {".pdf", ".docx", ".doc", ".txt", ".csv", ".xlsx"}
-SUPPORTED_AUDIO_EXTS = {".mp3", ".wav", ".ogg"}
-SUPPORTED_MEDIA_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS | SUPPORTED_DOC_EXTS | SUPPORTED_AUDIO_EXTS
+logger = logging.getLogger("image_utils")
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] [image_utils] %(message)s'))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-# --- Размеры по умолчанию ---
-MAX_IMAGE_SIZE = (1280, 1280)  # Максимальный размер для Telegram (по стороне)
-MAX_FILE_SIZE_MB = 50  # Ограничение Telegram на размер файла (50 МБ)
+SUPPORTED_IMAGE_EXTS: Set[str] = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+SUPPORTED_VIDEO_EXTS: Set[str] = {".mp4", ".mov", ".mkv"}
+SUPPORTED_DOC_EXTS: Set[str] = {".pdf", ".docx", ".doc", ".txt", ".csv", ".xlsx"}
+SUPPORTED_AUDIO_EXTS: Set[str] = {".mp3", ".wav", ".ogg"}
+SUPPORTED_MEDIA_EXTS: Set[str] = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS | SUPPORTED_DOC_EXTS | SUPPORTED_AUDIO_EXTS
+
+MAX_IMAGE_SIZE: Tuple[int, int] = (1280, 1280)
+MAX_FILE_SIZE_MB: int = 50
 
 def is_safe_media_path(path: Path, media_dir: Path) -> bool:
-    """Путь находится строго внутри media_dir и не содержит переходов наверх."""
+    """Путь должен быть строго внутри media_dir. Защита от directory traversal."""
     try:
-        return media_dir.resolve(strict=False) in path.resolve(strict=False).parents or path.resolve() == media_dir.resolve(strict=False)
-    except Exception:
+        return path.resolve().is_relative_to(media_dir.resolve())
+    except AttributeError:  # Python <3.9
+        try:
+            return str(media_dir.resolve()) in str(path.resolve().parents) or path.resolve() == media_dir.resolve()
+        except Exception as e:
+            logger.error(f"Ошибка проверки пути: {e}")
+            return False
+    except Exception as e:
+        logger.error(f"Ошибка проверки пути: {e}")
         return False
 
-def pick_random_media_file(media_dir: Path, allowed_exts: Optional[set] = None) -> Optional[Path]:
-    """
-    Случайно выбирает файл из media_dir (включая подпапки) с поддерживаемым расширением.
-    """
-    if not media_dir.exists():
-        return None
+def pick_random_media_file(media_dir: Path, allowed_exts: Optional[Set[str]] = None) -> Optional[Path]:
+    """Случайно выбирает файл из media_dir (рекурсивно) с поддерживаемым расширением."""
     allowed_exts = allowed_exts or SUPPORTED_MEDIA_EXTS
     files = [f for f in media_dir.rglob("*") if f.is_file() and f.suffix.lower() in allowed_exts]
     if not files:
+        logger.warning(f"Нет файлов с поддерживаемыми расширениями в {media_dir}")
         return None
     return random.choice(files)
 
 def validate_media_file(path: Path, media_dir: Path = Path("media")) -> Tuple[bool, str]:
     """
-    Проверяет валидность медиа-файла:
-      - только из папки media (или подпапок)
-      - поддерживаемое расширение
-      - не превышает лимит размера
-      - файл существует
+    Проверяет валидность файла:
+    - В media_dir
+    - Поддерживаемое расширение
+    - Не превышает лимит размера
+    - Существует
+    - Не symlink
     """
     if not path.exists():
+        logger.error(f"Файл не найден: {path}")
         return False, "Файл не найден"
+    if path.is_symlink():
+        logger.error(f"Файл является symlink: {path}")
+        return False, "Файл является symlink"
     if not is_safe_media_path(path, media_dir):
+        logger.error(f"Файл вне папки media: {path}")
         return False, "Файл вне папки media"
     if path.suffix.lower() not in SUPPORTED_MEDIA_EXTS:
+        logger.error(f"Неподдерживаемый формат: {path.suffix} ({path})")
         return False, f"Неподдерживаемый формат: {path.suffix}"
     if path.stat().st_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        logger.error(f"Файл слишком большой (> {MAX_FILE_SIZE_MB} МБ): {path}")
         return False, f"Файл слишком большой (>{MAX_FILE_SIZE_MB} МБ)"
+    # MIME check (дополнительно)
+    mime, _ = mimetypes.guess_type(str(path))
+    if mime is None:
+        logger.warning(f"Не удалось определить MIME-тип: {path}")
     return True, "OK"
 
 def get_media_type(path: Path) -> str:
-    """
-    Определяет тип медиа-файла по расширению.
-    """
+    """Определяет тип файла по расширению."""
     ext = path.suffix.lower()
     if ext in SUPPORTED_IMAGE_EXTS:
         return "image"
@@ -2036,49 +2056,53 @@ def get_media_type(path: Path) -> str:
         return "audio"
     return "unknown"
 
-def process_image(path: Path, output_dir: Optional[Path] = None, max_size: Tuple[int,int]=MAX_IMAGE_SIZE) -> Optional[Path]:
-    """
-    Уменьшает изображение до max_size по большей стороне (если требуется). Возвращает путь к новому файлу.
-    """
+def process_image(path: Path, output_dir: Optional[Path] = None, max_size: Tuple[int, int] = MAX_IMAGE_SIZE) -> Optional[Path]:
+    """Уменьшает изображение до max_size, если требуется. Возвращает путь к новому файлу."""
     try:
-        img = Image.open(path)
-        img.thumbnail(max_size, Image.ANTIALIAS)
-        out_dir = output_dir or path.parent
-        out_path = out_dir / f"{path.stem}_resized{path.suffix}"
-        img.save(out_path)
-        return out_path
+        with Image.open(path) as img:
+            if img.size[0] <= max_size[0] and img.size[1] <= max_size[1]:
+                logger.info(f"Изображение уже в допустимом размере: {path}")
+                return path
+            img.thumbnail(max_size, Image.LANCZOS)
+            out_dir = output_dir or path.parent
+            out_path = out_dir / f"{path.stem}_resized{path.suffix}"
+            img.save(out_path)
+            logger.info(f"Изображение уменьшено и сохранено в: {out_path}")
+            return out_path
     except UnidentifiedImageError:
+        logger.error(f"Не удалось открыть изображение: {path}")
         return None
-    except Exception:
+    except Exception as e:
+        logger.error(f"Ошибка обработки изображения {path}: {e}")
         return None
 
-def get_all_media_files(media_dir: Path, allowed_exts: Optional[set] = None) -> List[Path]:
-    """
-    Возвращает список всех файлов в media_dir (и подпапках) с нужными расширениями.
-    """
+def get_all_media_files(media_dir: Path, allowed_exts: Optional[Set[str]] = None) -> List[Path]:
+    """Список всех файлов в media_dir c поддерживаемыми расширениями."""
     allowed_exts = allowed_exts or SUPPORTED_MEDIA_EXTS
     return [f for f in media_dir.rglob("*") if f.is_file() and f.suffix.lower() in allowed_exts]
 
 def prepare_media_for_post(media_dir: Path = Path("media")) -> Optional[Path]:
-    """
-    Выбирает и валидирует случайный файл из media_dir.
-    Если файл — изображение, при необходимости уменьшает размер.
-    Возвращает путь к подготовленному файлу или None.
-    """
+    """Выбирает и валидирует случайный медиа-файл. При необходимости уменьшает изображение."""
     file = pick_random_media_file(media_dir)
     if not file:
+        logger.warning("Не найден ни один подходящий медиа-файл для публикации.")
         return None
     is_valid, reason = validate_media_file(file, media_dir)
     if not is_valid:
+        logger.error(f"Медиа-файл не прошёл валидацию: {file}. Причина: {reason}")
         return None
     media_type = get_media_type(file)
     if media_type == "image":
-        # Проверим размер, если большое — уменьшим
-        img = Image.open(file)
-        if img.size[0] > MAX_IMAGE_SIZE[0] or img.size[1] > MAX_IMAGE_SIZE[1]:
-            resized = process_image(file)
-            if resized is not None:
-                return resized
+        try:
+            with Image.open(file) as img:
+                if img.size[0] > MAX_IMAGE_SIZE[0] or img.size[1] > MAX_IMAGE_SIZE[1]:
+                    resized = process_image(file)
+                    if resized is not None:
+                        return resized
+                return file
+        except Exception as e:
+            logger.error(f"Ошибка открытия изображения: {e}")
+            return None
     return file
 
 # код - rag_text_utils.py
@@ -2373,6 +2397,16 @@ except ImportError:
     print("python-docx не установлен. Функциональность DOCX недоступна.")
 
 from advanced_rag_pipeline import Document, AdvancedRAGPipeline
+
+def is_safe_path(path: Path, allowed_dir: Path) -> bool:
+    """
+    Безопасная проверка, что path лежит строго внутри allowed_dir или равен ему.
+    Защита от directory traversal.
+    """
+    try:
+        return allowed_dir.resolve(strict=True) in path.resolve(strict=True).parents or path.resolve(strict=True) == allowed_dir.resolve(strict=True)
+    except Exception:
+        return False
 
 class DataIngestionManager:
     """Менеджер для загрузки данных из различных источников"""

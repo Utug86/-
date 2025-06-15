@@ -47,3 +47,10 @@
         "processed_topics_file": "data/processed_topics.txt"
     }
 }
+{
+    "temp_files": {
+        "cleanup_interval_hours": 24,
+        "max_size_mb": 1000,
+        "min_free_space_mb": 500
+    }
+}

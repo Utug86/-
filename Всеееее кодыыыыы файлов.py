@@ -152,7 +152,7 @@ class RAGSystem:
         except Exception as e:
             raise ProcessingError(f"Failed to load topics: {e}")
 
-    async def process_topics(self):
+        async def process_topics(self):
         """Обработка тем из topics.txt"""
         topics = self._load_remaining_topics()
         self.stats.total_topics = len(topics)
@@ -2384,59 +2384,52 @@ import os
 import json
 import csv
 import requests
-from typing import List, Dict, Optional, Generator
+from typing import List, Dict, Optional
 from pathlib import Path
 import asyncio
 import aiohttp
 from dataclasses import dataclass
-import xml.etree.ElementTree as ET
-from urllib.parse import urlparse, urljoin
+from utils.path_utils import validate_path
 from utils.exceptions import ProcessingError, FileOperationError
 import time
 import hashlib
 
-# Попытка импорта дополнительных библиотек (установить при необходимости)
 try:
     import PyPDF2
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
-    print("PyPDF2 не установлен. Функциональность PDF недоступна.")
 
 try:
     from bs4 import BeautifulSoup
     BS4_AVAILABLE = True
 except ImportError:
     BS4_AVAILABLE = False
-    print("BeautifulSoup4 не установлен. Функциональность парсинга HTML недоступна.")
 
 try:
     import docx
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
-    print("python-docx не установлен. Функциональность DOCX недоступна.")
 
 from advanced_rag_pipeline import Document, AdvancedRAGPipeline
 
-def is_safe_path(path: Path, allowed_dir: Path) -> bool:
-    """
-    Безопасная проверка, что path лежит строго внутри allowed_dir или равен ему.
-    Защита от directory traversal.
-    """
-    try:
-        return allowed_dir.resolve(strict=True) in path.resolve(strict=True).parents or path.resolve(strict=True) == allowed_dir.resolve(strict=True)
-    except Exception:
-        return False
-
 class DataIngestionManager:
     """Менеджер для загрузки данных из различных источников"""
+
     def __init__(self, rag_pipeline: AdvancedRAGPipeline):
         self.rag = rag_pipeline
+        self.allowed_data_dir = Path("./data").resolve()
 
     def load_from_text_file(self, filepath: str, encoding: str = 'utf-8') -> str:
+        path = Path(filepath)
+        is_valid, reason = validate_path(
+            path, allowed_dir=self.allowed_data_dir, allowed_exts={".txt"}, max_size_mb=50
+        )
+        if not is_valid:
+            raise FileOperationError(f"Невалидный путь/файл: {reason}")
         try:
-            with open(filepath, 'r', encoding=encoding) as f:
+            with open(path, 'r', encoding=encoding) as f:
                 return f.read()
         except Exception as e:
             raise FileOperationError(f"Ошибка чтения файла {filepath}: {e}") from e
@@ -2444,9 +2437,15 @@ class DataIngestionManager:
     def load_from_pdf(self, filepath: str) -> str:
         if not PDF_AVAILABLE:
             raise ProcessingError("PyPDF2 не установлен. Установите: pip install PyPDF2")
+        path = Path(filepath)
+        is_valid, reason = validate_path(
+            path, allowed_dir=self.allowed_data_dir, allowed_exts={".pdf"}, max_size_mb=50
+        )
+        if not is_valid:
+            raise FileOperationError(f"Невалидный путь/файл: {reason}")
         try:
             text = ""
-            with open(filepath, 'rb') as f:
+            with open(path, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
                 for page in reader.pages:
                     text += (page.extract_text() or "") + "\n"
@@ -2457,17 +2456,29 @@ class DataIngestionManager:
     def load_from_docx(self, filepath: str) -> str:
         if not DOCX_AVAILABLE:
             raise ProcessingError("python-docx не установлен. Установите: pip install python-docx")
+        path = Path(filepath)
+        is_valid, reason = validate_path(
+            path, allowed_dir=self.allowed_data_dir, allowed_exts={".docx"}, max_size_mb=50
+        )
+        if not is_valid:
+            raise FileOperationError(f"Невалидный путь/файл: {reason}")
         try:
-            doc = docx.Document(filepath)
+            doc = docx.Document(path)
             text = "\n".join(paragraph.text for paragraph in doc.paragraphs)
             return text
         except Exception as e:
             raise FileOperationError(f"Ошибка чтения DOCX {filepath}: {e}") from e
 
     def load_from_csv(self, filepath: str, text_columns: List[str]) -> List[Dict]:
+        path = Path(filepath)
+        is_valid, reason = validate_path(
+            path, allowed_dir=self.allowed_data_dir, allowed_exts={".csv"}, max_size_mb=50
+        )
+        if not is_valid:
+            raise FileOperationError(f"Невалидный путь/файл: {reason}")
         try:
             documents = []
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for i, row in enumerate(reader):
                     content_parts = [str(row[col]) for col in text_columns if col in row and row[col]]
@@ -2480,8 +2491,14 @@ class DataIngestionManager:
             raise FileOperationError(f"Ошибка чтения CSV {filepath}: {e}") from e
 
     def load_from_json(self, filepath: str, content_field: str, id_field: Optional[str] = None) -> List[Dict]:
+        path = Path(filepath)
+        is_valid, reason = validate_path(
+            path, allowed_dir=self.allowed_data_dir, allowed_exts={".json"}, max_size_mb=50
+        )
+        if not is_valid:
+            raise FileOperationError(f"Невалидный путь/файл: {reason}")
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             documents = []
             if isinstance(data, list):
@@ -2537,32 +2554,27 @@ class DataIngestionManager:
         async with aiohttp.ClientSession() as session:
             tasks = [fetch_url(session, url) for url in urls]
             results = await asyncio.gather(*tasks)
-            return [r for r in results if r['content']]  # Возвращаем только успешные
+            return [r for r in results if r['content']]
 
 class RAGAnalytics:
     """Аналитика и мониторинг RAG системы"""
-    
     def __init__(self, rag_pipeline: AdvancedRAGPipeline):
         self.rag = rag_pipeline
         self.query_log = []
-    
+
     def log_query(self, query: str, results_count: int, processing_time: float):
-        """Логирование запроса"""
         self.query_log.append({
             'timestamp': time.time(),
             'query': query,
             'results_count': results_count,
             'processing_time': processing_time
         })
-    
+
     def get_query_stats(self) -> Dict:
-        """Статистика по запросам"""
         if not self.query_log:
             return {"message": "Нет данных по запросам"}
-        
         processing_times = [log['processing_time'] for log in self.query_log]
         results_counts = [log['results_count'] for log in self.query_log]
-        
         return {
             'total_queries': len(self.query_log),
             'avg_processing_time': sum(processing_times) / len(processing_times),
@@ -2571,37 +2583,27 @@ class RAGAnalytics:
             'avg_results_count': sum(results_counts) / len(results_counts),
             'queries_per_hour': len([q for q in self.query_log if time.time() - q['timestamp'] < 3600])
         }
-    
+
     def analyze_collection_content(self) -> Dict:
-        """Анализ контента коллекции"""
         try:
-            # Получаем все документы
             all_data = self.rag.collection.get()
             documents = all_data.get('documents', [])
             metadatas = all_data.get('metadatas', [])
-            
             if not documents:
                 return {"message": "Коллекция пуста"}
-            
-            # Базовая статистика
             total_docs = len(documents)
             total_chars = sum(len(doc) for doc in documents)
             avg_doc_length = total_chars / total_docs
-            
-            # Анализ метаданных
             categories = {}
             languages = {}
-            
             for metadata in metadatas:
                 if metadata:
                     if 'category' in metadata:
                         cat = metadata['category']
                         categories[cat] = categories.get(cat, 0) + 1
-                    
                     if 'language' in metadata:
                         lang = metadata['language']
                         languages[lang] = languages.get(lang, 0) + 1
-            
             return {
                 'total_documents': total_docs,
                 'total_characters': total_chars,
@@ -2611,19 +2613,16 @@ class RAGAnalytics:
                 'longest_document': max(len(doc) for doc in documents),
                 'shortest_document': min(len(doc) for doc in documents)
             }
-            
         except Exception as e:
             return {"error": f"Ошибка анализа: {e}"}
 
 class RAGWebInterface:
     """Простой веб-интерфейс для RAG системы"""
-    
     def __init__(self, rag_pipeline: AdvancedRAGPipeline, analytics: RAGAnalytics):
         self.rag = rag_pipeline
         self.analytics = analytics
-    
+
     def generate_html_interface(self) -> str:
-        """Генерация HTML интерфейса"""
         html_template = """
         <!DOCTYPE html>
         <html>
@@ -2645,14 +2644,11 @@ class RAGWebInterface:
         <body>
             <div class="container">
                 <h1>🔍 RAG Pipeline Interface</h1>
-                
                 <div class="search-section">
                     <input type="text" class="search-box" id="searchInput" placeholder="Введите ваш запрос...">
                     <button class="search-btn" onclick="performSearch()">Поиск</button>
                 </div>
-                
                 <div id="results"></div>
-                
                 <h2>📊 Статистика системы</h2>
                 <div class="stats" id="stats">
                     <div class="stat-card">
@@ -2664,62 +2660,44 @@ class RAGWebInterface:
                         <div id="avgTime">Загрузка...</div>
                     </div>
                 </div>
-                
                 <h2>📈 Управление данными</h2>
                 <div style="margin: 20px 0;">
                     <button onclick="exportData()" style="margin-right: 10px; padding: 8px 16px; background: #28a745; color: white; border: none; border-radius: 4px;">Экспорт данных</button>
                     <button onclick="clearCollection()" style="padding: 8px 16px; background: #dc3545; color: white; border: none; border-radius: 4px;">Очистить коллекцию</button>
                 </div>
             </div>
-            
             <script>
                 async function performSearch() {
                     const query = document.getElementById('searchInput').value;
                     if (!query.trim()) return;
-                    
                     const resultsDiv = document.getElementById('results');
                     resultsDiv.innerHTML = '<div>Поиск...</div>';
-                    
-                    try {
-                        // Здесь будет API вызов к серверу RAG
-                        // Для демонстрации показываем статичные результаты
-                        setTimeout(() => {
-                            resultsDiv.innerHTML = `
-                                <h3>Результаты поиска для: "${query}"</h3>
-                                <div class="result">
-                                    <strong>Документ 1</strong>
-                                    <div class="score">Релевантность: 0.85</div>
-                                    <p>Пример найденного контента...</p>
-                                    <div class="metadata">Метаданные: category=ai, timestamp=2024-01-01</div>
-                                </div>
-                            `;
-                        }, 1000);
-                    } catch (error) {
-                        resultsDiv.innerHTML = '<div style="color: red;">Ошибка поиска: ' + error.message + '</div>';
-                    }
+                    setTimeout(() => {
+                        resultsDiv.innerHTML = `
+                            <h3>Результаты поиска для: "${query}"</h3>
+                            <div class="result">
+                                <strong>Документ 1</strong>
+                                <div class="score">Релевантность: 0.85</div>
+                                <p>Пример найденного контента...</p>
+                                <div class="metadata">Метаданные: category=ai, timestamp=2024-01-01</div>
+                            </div>
+                        `;
+                    }, 1000);
                 }
-                
                 function loadStats() {
-                    // Здесь будет загрузка реальной статистики
                     document.getElementById('docCount').textContent = '150';
                     document.getElementById('queryCount').textContent = '45';
                     document.getElementById('avgTime').textContent = '0.3s';
                 }
-                
                 function exportData() {
                     alert('Функция экспорта будет реализована на сервере');
                 }
-                
                 function clearCollection() {
                     if (confirm('Вы уверены, что хотите очистить коллекцию?')) {
                         alert('Функция очистки будет реализована на сервере');
                     }
                 }
-                
-                // Загрузка статистики при загрузке страницы
                 window.onload = loadStats;
-                
-                // Поиск по Enter
                 document.getElementById('searchInput').addEventListener('keypress', function(e) {
                     if (e.key === 'Enter') {
                         performSearch();
@@ -2730,9 +2708,8 @@ class RAGWebInterface:
         </html>
         """
         return html_template
-    
+
     def save_interface(self, filepath: str = "rag_interface.html"):
-        """Сохранение HTML интерфейса в файл"""
         html_content = self.generate_html_interface()
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(html_content)
@@ -2740,24 +2717,20 @@ class RAGWebInterface:
 
 class RAGBenchmarking:
     """Бенчмаркинг и тестирование RAG системы"""
-    
     def __init__(self, rag_pipeline: AdvancedRAGPipeline):
         self.rag = rag_pipeline
-    
+
     def create_test_dataset(self, size: int = 100) -> List[Document]:
-        """Создание тестового датасета"""
         test_topics = [
             "машинное обучение", "искусственный интеллект", "нейронные сети",
             "векторные базы данных", "обработка естественного языка",
             "компьютерное зрение", "глубокое обучение", "анализ данных",
             "программирование на Python", "веб-разработка"
         ]
-        
         documents = []
         for i in range(size):
             topic = test_topics[i % len(test_topics)]
             content = self._generate_synthetic_content(topic, i)
-            
             doc = Document(
                 id=f"test_doc_{i}",
                 content=content,
@@ -2768,25 +2741,19 @@ class RAGBenchmarking:
                 }
             )
             documents.append(doc)
-        
         return documents
-    
+
     def _generate_synthetic_content(self, topic: str, doc_id: int) -> str:
-        """Генерация синтетического контента для тестов"""
         templates = [
             f"{topic} является важной областью современной технологии. Документ номер {doc_id} содержит подробную информацию о применении {topic} в различных сферах.",
             f"В этом документе рассматриваются основные принципы {topic}. Это руководство номер {doc_id} поможет понять ключевые концепции.",
             f"Практическое применение {topic} демонстрируется в примере {doc_id}. Здесь представлены лучшие практики и методы."
         ]
-        
         base_content = templates[doc_id % len(templates)]
-        # Добавляем дополнительный контент для разнообразия
         additional = f" Дополнительные детали включают технические аспекты, примеры использования и рекомендации экспертов в области {topic}."
-        
         return base_content + additional
-    
+
     def benchmark_search_performance(self, queries: List[str], n_runs: int = 10) -> Dict:
-        """Бенчмарк производительности поиска"""
         results = {
             'queries': [],
             'avg_time': 0,
@@ -2794,35 +2761,27 @@ class RAGBenchmarking:
             'fastest_query': None,
             'slowest_query': None
         }
-        
         total_time = 0
         fastest_time = float('inf')
         slowest_time = 0
-        
         for query in queries:
             query_times = []
-            
             for _ in range(n_runs):
                 start_time = time.time()
-                search_results = self.rag.search(query, n_results=5)
+                self.rag.search(query, n_results=5)
                 end_time = time.time()
-                
                 query_time = end_time - start_time
                 query_times.append(query_time)
                 total_time += query_time
-            
             avg_query_time = sum(query_times) / len(query_times)
             min_query_time = min(query_times)
             max_query_time = max(query_times)
-            
             if min_query_time < fastest_time:
                 fastest_time = min_query_time
                 results['fastest_query'] = query
-            
             if max_query_time > slowest_time:
                 slowest_time = max_query_time
                 results['slowest_query'] = query
-            
             results['queries'].append({
                 'query': query,
                 'avg_time': avg_query_time,
@@ -2830,288 +2789,50 @@ class RAGBenchmarking:
                 'max_time': max_query_time,
                 'runs': n_runs
             })
-        
         results['avg_time'] = total_time / (len(queries) * n_runs)
         results['total_time'] = total_time
         results['fastest_time'] = fastest_time
         results['slowest_time'] = slowest_time
-        
         return results
-    
+
     def evaluate_retrieval_quality(self, test_queries: List[Dict]) -> Dict:
-        """Оценка качества поиска
-        test_queries: [{'query': str, 'relevant_doc_ids': List[str]}]
-        """
         metrics = {
             'precision_at_k': [],
             'recall_at_k': [],
             'average_precision': []
         }
-        
         for test_case in test_queries:
             query = test_case['query']
             relevant_ids = set(test_case['relevant_doc_ids'])
-            
-            # Получаем результаты поиска
             results = self.rag.search(query, n_results=10)
             retrieved_ids = [r.document_id for r in results]
-            
-            # Вычисляем метрики для разных K
             for k in [1, 3, 5, 10]:
                 if k <= len(retrieved_ids):
                     retrieved_k = set(retrieved_ids[:k])
-                    
-                    # Precision@K
                     precision = len(retrieved_k & relevant_ids) / k
-                    
-                    # Recall@K
                     recall = len(retrieved_k & relevant_ids) / len(relevant_ids) if relevant_ids else 0
-                    
                     metrics['precision_at_k'].append(precision)
                     metrics['recall_at_k'].append(recall)
-            
-            # Average Precision
             ap = self._calculate_average_precision(retrieved_ids, relevant_ids)
             metrics['average_precision'].append(ap)
-        
-        # Усредняем метрики
         final_metrics = {
             'mean_precision_at_k': sum(metrics['precision_at_k']) / len(metrics['precision_at_k']) if metrics['precision_at_k'] else 0,
             'mean_recall_at_k': sum(metrics['recall_at_k']) / len(metrics['recall_at_k']) if metrics['recall_at_k'] else 0,
             'mean_average_precision': sum(metrics['average_precision']) / len(metrics['average_precision']) if metrics['average_precision'] else 0
         }
-        
         return final_metrics
-    
+
     def _calculate_average_precision(self, retrieved_ids: List[str], relevant_ids: set) -> float:
-        """Вычисление Average Precision"""
         if not relevant_ids:
             return 0.0
-        
         precisions = []
         relevant_count = 0
-        
         for i, doc_id in enumerate(retrieved_ids):
             if doc_id in relevant_ids:
                 relevant_count += 1
                 precision = relevant_count / (i + 1)
                 precisions.append(precision)
-        
         return sum(precisions) / len(relevant_ids) if precisions else 0.0
-
-# Дополнительные утилиты
-class RAGConfigManager:
-    """Менеджер конфигурации RAG системы"""
-    
-    def __init__(self, config_path: str = "rag_config.json"):
-        self.config_path = config_path
-        self.default_config = {
-            "embedding_model": "all-MiniLM-L6-v2",
-            "chunk_size": 500,
-            "chunk_overlap": 50,
-            "collection_name": "default_rag",
-            "persist_directory": "./rag_storage",
-            "search_results_limit": 5,
-            "similarity_threshold": 0.3,
-            "batch_size": 100,
-            "logging_level": "INFO"
-        }
-        self.config = self.load_config()
-    
-    def load_config(self) -> Dict:
-        """Загрузка конфигурации"""
-        try:
-            if os.path.exists(self.config_path):
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                # Дополняем недостающими параметрами
-                for key, value in self.default_config.items():
-                    if key not in config:
-                        config[key] = value
-                return config
-            else:
-                return self.default_config.copy()
-        except Exception as e:
-            print(f"Ошибка загрузки конфигурации: {e}")
-            return self.default_config.copy()
-    
-    def save_config(self):
-        """Сохранение конфигурации"""
-        try:
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"Ошибка сохранения конфигурации: {e}")
-    
-    def update_config(self, updates: Dict):
-        """Обновление конфигурации"""
-        self.config.update(updates)
-        self.save_config()
-    
-    def get(self, key: str, default=None):
-        """Получение значения конфигурации"""
-        return self.config.get(key, default)
-
-# Пример интеграции всех компонентов
-class FullRAGSystem:
-    """Полная RAG система со всеми компонентами"""
-    
-    def __init__(self, config_path: str = "rag_config.json"):
-        # Загружаем конфигурацию
-        self.config_manager = RAGConfigManager(config_path)
-        config = self.config_manager.config
-        
-        # Инициализируем основную систему
-        self.rag = AdvancedRAGPipeline(
-            collection_name=config['collection_name'],
-            persist_directory=config['persist_directory'],
-            embedding_model=config['embedding_model']
-        )
-        
-        # Инициализируем дополнительные компоненты
-        self.data_manager = DataIngestionManager(self.rag)
-        self.analytics = RAGAnalytics(self.rag)
-        self.web_interface = RAGWebInterface(self.rag, self.analytics)
-        self.benchmarking = RAGBenchmarking(self.rag)
-        
-        print("🚀 Полная RAG система инициализирована!")
-    
-    def ingest_directory(self, directory_path: str, file_extensions: List[str] = None):
-        """Загрузка всех файлов из директории"""
-        if file_extensions is None:
-            file_extensions = ['.txt', '.pdf', '.docx', '.json', '.csv']
-        
-        directory = Path(directory_path)
-        if not directory.exists():
-            raise Exception(f"Директория {directory_path} не существует")
-        
-        documents = []
-        
-        for file_path in directory.rglob('*'):
-            if file_path.is_file() and file_path.suffix.lower() in file_extensions:
-                try:
-                    if file_path.suffix.lower() == '.txt':
-                        content = self.data_manager.load_from_text_file(str(file_path))
-                        doc = Document(
-                            id=str(file_path.stem),
-                            content=content,
-                            metadata={'source_file': str(file_path), 'file_type': 'text'}
-                        )
-                        documents.append(doc)
-                    
-                    elif file_path.suffix.lower() == '.pdf' and PDF_AVAILABLE:
-                        content = self.data_manager.load_from_pdf(str(file_path))
-                        doc = Document(
-                            id=str(file_path.stem),
-                            content=content,
-                            metadata={'source_file': str(file_path), 'file_type': 'pdf'}
-                        )
-                        documents.append(doc)
-                    
-                    elif file_path.suffix.lower() == '.docx' and DOCX_AVAILABLE:
-                        content = self.data_manager.load_from_docx(str(file_path))
-                        doc = Document(
-                            id=str(file_path.stem),
-                            content=content,
-                            metadata={'source_file': str(file_path), 'file_type': 'docx'}
-                        )
-                        documents.append(doc)
-                    
-                    print(f"✅ Обработан файл: {file_path.name}")
-                    
-                except Exception as e:
-                    print(f"❌ Ошибка обработки файла {file_path.name}: {e}")
-        
-        if documents:
-            self.rag.add_documents_batch(documents)
-            print(f"📚 Загружено {len(documents)} документов из {directory_path}")
-        else:
-            print("⚠️ Не найдено подходящих файлов для загрузки")
-    
-    def create_web_interface(self, output_path: str = "rag_interface.html"):
-        """Создание веб-интерфейса"""
-        self.web_interface.save_interface(output_path)
-        print(f"🌐 Веб-интерфейс создан: {output_path}")
-    
-    def run_performance_test(self):
-        """Запуск тестов производительности"""
-        test_queries = [
-            "машинное обучение",
-            "векторные базы данных",
-            "обработка текста",
-            "искусственный интеллект",
-            "Python программирование"
-        ]
-        
-        print("🧪 Запуск тестов производительности...")
-        results = self.benchmarking.benchmark_search_performance(test_queries)
-        
-        print(f"📊 Результаты тестирования:")
-        print(f"   Среднее время поиска: {results['avg_time']:.3f}s")
-        print(f"   Самый быстрый запрос: {results['fastest_query']} ({results['fastest_time']:.3f}s)")
-        print(f"   Самый медленный запрос: {results['slowest_query']} ({results['slowest_time']:.3f}s)")
-        
-        return results
-    
-    def get_system_status(self) -> Dict:
-        """Получение статуса системы"""
-        collection_stats = self.rag.get_collection_stats()
-        query_stats = self.analytics.get_query_stats()
-        content_analysis = self.analytics.analyze_collection_content()
-        
-        return {
-            'collection_stats': collection_stats,
-            'query_stats': query_stats,
-            'content_analysis': content_analysis,
-            'config': self.config_manager.config
-        }
-
-# Демонстрация использования всех компонентов
-if __name__ == "__main__":
-    print("🔧 Инициализация полной RAG системы...")
-    
-    # Создаем полную систему
-    full_system = FullRAGSystem()
-    
-    # Создаем тестовые данные
-    test_docs = [
-        Document(
-            id="advanced_doc_1",
-            content="Расширенные возможности RAG включают обработку различных форматов файлов, асинхронную загрузку данных и аналитику производительности.",
-            metadata={"category": "advanced", "topic": "rag_features"}
-        ),
-        Document(
-            id="advanced_doc_2", 
-            content="Система мониторинга позволяет отслеживать производительность поиска, анализировать запросы пользователей и оптимизировать работу векторной базы данных.",
-            metadata={"category": "monitoring", "topic": "analytics"}
-        )
-    ]
-    
-    # Добавляем документы
-    full_system.rag.add_documents_batch(test_docs)
-    
-    # Тестируем поиск
-    print("\n🔍 Тестирование поиска...")
-    results = full_system.rag.search("аналитика производительности RAG", n_results=2)
-    for i, result in enumerate(results):
-        print(f"Результат {i+1}: {result.content[:100]}... (схожесть: {result.similarity_score:.3f})")
-    
-    # Получаем статус системы
-    print("\n📊 Статус системы:")
-    status = full_system.get_system_status()
-    print(json.dumps(status, indent=2, ensure_ascii=False))
-    
-    # Создаем веб-интерфейс
-    full_system.create_web_interface()
-    
-    # Запускаем тесты производительности
-    performance_results = full_system.run_performance_test()
-    
-    print("\n✅ Демонстрация завершена! Система готова к использованию.")card">
-                        <h3>Документы</h3>
-                        <div id="docCount">Загрузка...</div>
-                    </div>
-                    <div class="stat-
 
 
 # код - rag_lmclient.py
@@ -3509,19 +3230,37 @@ import json
 from typing import Dict, Any, Set
 from datetime import datetime
 import logging
+from utils.exceptions import FileOperationError
+from filelock import FileLock, Timeout
 
 class StateManager:
     def __init__(self, state_file: Path):
         self.state_file = state_file
         self.logger = logging.getLogger("state_manager")
+        self.lock_file = self.state_file.with_suffix(".lock")
         self.state: Dict[str, Any] = self._load_state()
 
     def _load_state(self) -> Dict[str, Any]:
-        """Загрузка состояния из файла"""
+        """Загрузка состояния из файла (с автоматическим приведением processed_topics к set)"""
         if self.state_file.exists():
             try:
-                with open(self.state_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                with FileLock(str(self.lock_file), timeout=10):
+                    with open(self.state_file, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                # processed_topics всегда приводим к set
+                if "processed_topics" in state:
+                    state["processed_topics"] = set(state["processed_topics"])
+                else:
+                    state["processed_topics"] = set()
+                if "failed_topics" not in state:
+                    state["failed_topics"] = {}
+                if "statistics" not in state:
+                    state["statistics"] = {
+                        "total_processed": 0,
+                        "successful": 0,
+                        "failed": 0
+                    }
+                return state
             except Exception as e:
                 self.logger.error(f"Failed to load state: {e}")
                 return self._create_default_state()
@@ -3541,21 +3280,25 @@ class StateManager:
         }
 
     def save_state(self):
-        """Сохранение состояния"""
+        """Сохранение состояния (атомарно, с file lock)"""
         try:
-            # Конвертируем set в list для JSON
-            state_copy = self.state.copy()
-            state_copy["processed_topics"] = list(self.state["processed_topics"])
-            state_copy["last_update"] = datetime.utcnow().isoformat()
-
-            with open(self.state_file, 'w', encoding='utf-8') as f:
-                json.dump(state_copy, f, indent=4, ensure_ascii=False)
+            with FileLock(str(self.lock_file), timeout=10):
+                # Конвертируем set в list для JSON
+                state_copy = self.state.copy()
+                state_copy["processed_topics"] = list(self.state["processed_topics"])
+                state_copy["last_update"] = datetime.utcnow().isoformat()
+                tmp_file = self.state_file.with_suffix('.tmp')
+                with open(tmp_file, 'w', encoding='utf-8') as f:
+                    json.dump(state_copy, f, indent=4, ensure_ascii=False)
+                tmp_file.replace(self.state_file)
         except Exception as e:
             self.logger.error(f"Failed to save state: {e}")
-            raise
+            raise FileOperationError(f"Failed to save state: {e}")
 
     def add_processed_topic(self, topic: str):
-        """Добавление обработанной темы"""
+        """Добавление обработанной темы (гарантия типа set)"""
+        if not isinstance(self.state["processed_topics"], set):
+            self.state["processed_topics"] = set(self.state["processed_topics"])
         self.state["processed_topics"].add(topic)
         self.state["statistics"]["total_processed"] += 1
         self.state["statistics"]["successful"] += 1
@@ -3572,7 +3315,9 @@ class StateManager:
         self.save_state()
 
     def get_processed_topics(self) -> Set[str]:
-        """Получение списка обработанных тем"""
+        """Получение списка обработанных тем (set всегда)"""
+        if not isinstance(self.state["processed_topics"], set):
+            self.state["processed_topics"] = set(self.state["processed_topics"])
         return self.state["processed_topics"]
 
     def get_failed_topics(self) -> Dict[str, Dict[str, Any]]:
@@ -3596,6 +3341,7 @@ import tempfile
 from typing import Optional, List
 import logging
 from datetime import datetime, timedelta
+from utils.path_utils import validate_path
 
 class TempFileManager:
     def __init__(self, temp_dir: Path):
@@ -3647,3 +3393,29 @@ class TempFileManager:
             except Exception as e:
                 self.logger.error(f"Failed to cleanup file {file_path}: {e}")
 
+# код - path_utils.py
+
+from pathlib import Path
+from typing import Optional, Set
+
+def validate_path(
+    path: Path,
+    allowed_dir: Path,
+    allowed_exts: Optional[Set[str]] = None,
+    max_size_mb: int = 100,
+    check_symlink: bool = True
+) -> (bool, str):
+    try:
+        path = path.resolve(strict=True)
+        allowed_dir = allowed_dir.resolve(strict=True)
+        if check_symlink and path.is_symlink():
+            return False, "Файл является symlink"
+        if not (allowed_dir in path.parents or path == allowed_dir):
+            return False, "Файл вне разрешённой директории"
+        if allowed_exts and path.suffix.lower() not in allowed_exts:
+            return False, f"Недопустимое расширение: {path.suffix}"
+        if path.stat().st_size > max_size_mb * 1024 * 1024:
+            return False, f"Файл слишком большой (> {max_size_mb} МБ)"
+        return True, "OK"
+    except Exception as e:
+        return False, f"Ошибка валидации пути: {e}"

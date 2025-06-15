@@ -18,6 +18,17 @@ from rag_lmclient import LMClient
 from rag_langchain_tools import enrich_context_with_tools
 from rag_prompt_utils import get_prompt_parts
 from image_utils import prepare_media_for_post, get_media_type
+from utils.config_manager import ConfigManager
+from utils.state_manager import StateManager
+from utils.exceptions import (
+    RAGException,
+    ConfigurationError,
+    InitializationError,
+    ProcessingError,
+    ModelError,
+    TelegramError,
+    FileOperationError,
+)
 
 @dataclass
 class SystemStats:
@@ -43,57 +54,37 @@ class SystemStats:
         )
         return stats
 
-class RAGException(Exception):
-    """Базовый класс для исключений RAG системы"""
-    pass
-
-class ConfigurationError(RAGException):
-    """Ошибки конфигурации"""
-    pass
-
-class InitializationError(RAGException):
-    """Ошибки инициализации компонентов"""
-    pass
-
-class ProcessingError(RAGException):
-    """Ошибки обработки данных"""
-    pass
-
 class RAGSystem:
     def __init__(self):
-        # Базовая инициализация
-        self.base_dir = Path(__file__).parent
-        self.setup_paths()
-        self.logger = get_logger(__name__, logfile=self.log_dir / "bot.log")
-        
-        # Статистика
+        # --- Загрузка конфигурации через ConfigManager ---
+        self.config_manager = ConfigManager(Path("config/config.json"))
+        self.logger = get_logger(__name__, logfile=self.config_manager.get_path("log_dir") / "bot.log")
+
+        # --- Пути из config_manager ---
+        self.data_dir = self.config_manager.get_path("data_dir")
+        self.log_dir = self.config_manager.get_path("log_dir")
+        self.inform_dir = self.config_manager.get_path("inform_dir")
+        self.config_dir = Path("config")  # для совместимости, можно убрать если не требуется
+        self.media_dir = self.config_manager.get_path("media_dir")
+        self.topics_file = self.data_dir / "topics.txt"
+        self.processed_topics_file = self.config_manager.get_path("processed_topics_file")
+        self.index_file = self.config_manager.get_path("index_file")
+        self.context_file = self.config_manager.get_path("context_file")
+        self.usage_stats_file = self.config_manager.get_path("usage_stats_file")
+
+        # --- Статистика ---
         self.stats = SystemStats()
-        
-        # Множество обработанных тем для быстрой проверки
-        self._processed_topics: Set[str] = set()
-        
-        # Флаг для graceful shutdown
+
+        # --- StateManager для прогресса ---
+        self.state_manager = StateManager(self.processed_topics_file)
+
+        # --- Флаг для graceful shutdown ---
         self.should_exit = False
         signal.signal(signal.SIGINT, self.handle_shutdown)
         signal.signal(signal.SIGTERM, self.handle_shutdown)
 
     def setup_paths(self):
-        """Инициализация и проверка необходимых директорий"""
-        # Основные директории
-        self.data_dir = self.base_dir / "data"
-        self.log_dir = self.base_dir / "logs"
-        self.inform_dir = self.base_dir / "inform"
-        self.config_dir = self.base_dir / "config"
-        self.media_dir = self.base_dir / "media"
-        
-        # Важные файлы
-        self.topics_file = self.data_dir / "topics.txt"
-        self.processed_topics_file = self.data_dir / "processed_topics.txt"
-        self.index_file = self.data_dir / "faiss_index.idx"
-        self.context_file = self.data_dir / "faiss_contexts.json"
-        self.usage_stats_file = self.data_dir / "usage_statistics.json"
-
-        # Создание директорий если не существуют
+        """Проверка и создание необходимых директорий"""
         required_dirs = [
             self.data_dir,
             self.log_dir,
@@ -103,102 +94,27 @@ class RAGSystem:
             self.data_dir / "prompt_1",
             self.data_dir / "prompt_2"
         ]
-        
         for directory in required_dirs:
             try:
                 directory.mkdir(parents=True, exist_ok=True)
             except Exception as e:
                 raise InitializationError(f"Failed to create directory {directory}: {e}")
 
-        # Проверка существования критичных файлов
+        # Проверка критичных файлов
         if not self.topics_file.exists():
             raise ConfigurationError("topics.txt not found")
-        
-        # Создание файла для обработанных тем если не существует
-        self.processed_topics_file.touch(exist_ok=True)
-
-    def __init__(self):
-        self.base_dir = Path(__file__).parent
-        self.config_manager = ConfigManager(self.base_dir / "config" / "config.json")
-        self.setup_paths()
-        """Загрузка конфигурации из файлов"""
-        try:
-            # Проверяем наличие необходимых файлов
-            token_file = self.config_dir / "telegram_token.txt"
-            channel_file = self.config_dir / "telegram_channel.txt"
-
-            if not token_file.exists():
-                raise ConfigurationError("telegram_token.txt not found")
-            if not channel_file.exists():
-                raise ConfigurationError("telegram_channel.txt not found")
-
-            # Читаем конфигурацию
-            bot_token = token_file.read_text(encoding="utf-8").strip()
-            channel_id = channel_file.read_text(encoding="utf-8").strip()
-
-            if not bot_token or not channel_id:
-                raise ConfigurationError(
-                    "Telegram token or channel ID is empty"
-                )
-
-            # Возвращаем полную конфигурацию
-            return {
-                "telegram": {
-                    "bot_token": bot_token,
-                    "channel_id": channel_id,
-                    "retry_attempts": 3,
-                    "retry_delay": 3.0,
-                    "enable_preview": True
-                },
-                "llm": {
-                    "model_url": "http://localhost:1234/v1/chat/completions",
-                    "model_name": "gemma-3-27b-it-GGUF/gemma-3-27b-it-Q4_K_M.gguf",
-                    "max_tokens": 4096,
-                    "max_chars": 4096,
-                    "max_chars_with_media": 1024,
-                    "temperature": 0.7,
-                    "timeout": 40,
-                    "history_limit": 3
-                },
-                "rag": {
-                    "chunk_usage_limit": 10,
-                    "usage_reset_days": 7,
-                    "diversity_boost": 0.3,
-                    "emb_model": "all-MiniLM-L6-v2",
-                    "cross_model": "cross-encoder/stsb-roberta-large",
-                    "chunk_size": 500,
-                    "overlap": 100,
-                    "top_k_title": 2,
-                    "top_k_faiss": 8,
-                    "top_k_final": 3
-                }
-            }
-        except Exception as e:
-            raise ConfigurationError(f"Failed to load configuration: {e}")
 
     def load_processed_topics(self) -> Set[str]:
-        """Загрузка списка обработанных тем"""
-        try:
-            if self.processed_topics_file.exists():
-                topics = set(self.processed_topics_file.read_text(
-                    encoding='utf-8').splitlines())
-                self.logger.info(f"Loaded {len(topics)} processed topics")
-                return topics
-            return set()
-        except Exception as e:
-            self.logger.warning(f"Failed to load processed topics: {e}")
-            return set()
+        """Загрузка списка обработанных тем через state_manager"""
+        return self.state_manager.get_processed_topics()
 
     def save_processed_topic(self, topic: str):
-        """Сохранение обработанной темы"""
-        try:
-            if topic not in self._processed_topics:
-                with open(self.processed_topics_file, 'a', encoding='utf-8') as f:
-                    f.write(f"{topic}\n")
-                self._processed_topics.add(topic)
-                self.logger.info(f"Topic '{topic}' marked as processed")
-        except Exception as e:
-            self.logger.error(f"Failed to save processed topic: {e}")
+        """Сохранение обработанной темы через state_manager"""
+        self.state_manager.add_processed_topic(topic)
+
+    def add_failed_topic(self, topic: str, error: str):
+        """Сохранение темы с ошибкой через state_manager"""
+        self.state_manager.add_failed_topic(topic, error)
 
     async def notify_error(self, message: str):
         """Отправка уведомления об ошибке в Telegram"""
@@ -214,7 +130,7 @@ class RAGSystem:
         """Обработчик сигналов завершения"""
         self.logger.info("Received shutdown signal, cleaning up...")
         self.should_exit = True
-        
+
         # Сохранение статистики перед выходом
         try:
             stats = self.stats.to_dict()
@@ -225,11 +141,12 @@ class RAGSystem:
         except Exception as e:
             self.logger.error(f"Failed to save statistics: {e}")
 
-    def _load_remaining_topics(self) -> List[str]:
+    def _load_remaining_topics(self) -> list:
         """Загрузка оставшихся тем для обработки"""
         try:
             all_topics = self.topics_file.read_text(encoding='utf-8').splitlines()
-            remaining = [t for t in all_topics if t not in self._processed_topics]
+            processed = self.load_processed_topics()
+            remaining = [t for t in all_topics if t not in processed]
             self.logger.info(f"Loaded {len(remaining)} remaining topics")
             return remaining
         except Exception as e:
@@ -237,52 +154,35 @@ class RAGSystem:
 
     async def process_topics(self):
         """Обработка тем из topics.txt"""
-        # Загрузка обработанных тем
-        self._processed_topics = self.load_processed_topics()
-        
-        # Загрузка оставшихся тем
         topics = self._load_remaining_topics()
-        
-        # Инициализация статистики
         self.stats.total_topics = len(topics)
         self.stats.start_time = datetime.now()
-        
-        # Обработка тем
+
         for topic in topics:
             if self.should_exit:
                 break
-
             self.stats.current_topic = topic
             processing_start = datetime.now()
-
             try:
                 self.logger.info(
                     f"Processing topic {self.stats.processed_topics + 1}/{self.stats.total_topics}: {topic}"
                 )
-                
-                # Обработка темы
                 text_length = await self.process_single_topic(topic)
-                
-                # Обновление статистики
                 self.stats.processed_topics += 1
                 self.stats.total_chars_generated += text_length
                 self.stats.avg_chars_per_topic = (
                     self.stats.total_chars_generated / self.stats.processed_topics
                 )
-                
-                # Сохранение прогресса
                 self.save_processed_topic(topic)
-                
-                # Обновление времени обработки
                 self.stats.last_processing_time = (
                     datetime.now() - processing_start
                 ).total_seconds()
-                
             except Exception as e:
                 error_msg = f"Error processing topic {topic}: {e}"
                 self.logger.error(error_msg)
                 self.stats.failed_topics += 1
                 self.stats.last_error = error_msg
+                self.add_failed_topic(topic, error_msg)
                 await self.notify_error(error_msg)
                 await asyncio.sleep(5)
 
@@ -294,18 +194,17 @@ class RAGSystem:
         try:
             # Получение контекста из RAG
             context = self.retriever.retrieve(topic)
-            
+
             # Обогащение контекста дополнительными инструментами
             context = enrich_context_with_tools(topic, context, self.inform_dir)
-            
+
             # Поиск файлов промптов
             prompt1_files = sorted((self.data_dir / "prompt_1").glob("*.txt"))
             prompt2_files = sorted((self.data_dir / "prompt_2").glob("*.txt"))
-            
+
             if not prompt1_files or not prompt2_files:
                 raise ProcessingError("No prompt files found")
-            
-            # Случайный выбор файлов промптов
+
             import random
             file1 = random.choice(prompt1_files)
             file2 = random.choice(prompt2_files)
@@ -319,11 +218,10 @@ class RAGSystem:
                 file2=file2
             )
 
-            # Определение максимальной длины текста
             max_chars = (
-                self.config["llm"]["max_chars_with_media"]
+                self.llm_config["max_chars_with_media"]
                 if "{UPLOADFILE}" in prompt_full
-                else self.config["llm"]["max_chars"]
+                else self.llm_config["max_chars"]
             )
 
             # Генерация текста
@@ -331,7 +229,7 @@ class RAGSystem:
                 topic,
                 max_chars=max_chars
             )
-            
+
             if not text:
                 raise ProcessingError("Failed to generate text")
 
@@ -345,7 +243,7 @@ class RAGSystem:
                 f"Successfully processed topic: {topic}, "
                 f"text length: {len(text)}"
             )
-            
+
             return len(text)
 
         except Exception as e:
@@ -381,30 +279,35 @@ class RAGSystem:
     async def run(self):
         """Основной метод запуска системы"""
         try:
-            # Загрузка конфигурации
-            self.config = self.load_config()
-            
-            # Инициализация компонентов
+            # --- Загрузка параметров из конфиг-менеджера ---
+            self.telegram_config = self.config_manager.get_telegram_config()
+            self.llm_config = self.config_manager.config['language_model']
+            self.retrieval_config = self.config_manager.config['retrieval']
+            self.system_config = self.config_manager.config['system']
+
+            # --- Инициализация компонентов ---
+            self.setup_paths()
+
             self.usage_tracker = ChunkUsageTracker(
                 usage_stats_file=self.usage_stats_file,
                 logger=self.logger,
-                chunk_usage_limit=self.config["rag"]["chunk_usage_limit"],
-                usage_reset_days=self.config["rag"]["usage_reset_days"],
-                diversity_boost=self.config["rag"]["diversity_boost"]
+                chunk_usage_limit=self.system_config["chunk_usage_limit"],
+                usage_reset_days=self.system_config["usage_reset_days"],
+                diversity_boost=self.system_config["diversity_boost"]
             )
             self.usage_tracker.cleanup_old_stats()
 
             self.retriever = HybridRetriever(
-                emb_model=self.config["rag"]["emb_model"],
-                cross_model=self.config["rag"]["cross_model"],
+                emb_model=self.retrieval_config["embedding_model"],
+                cross_model=self.retrieval_config["cross_encoder"],
                 index_file=self.index_file,
                 context_file=self.context_file,
                 inform_dir=self.inform_dir,
-                chunk_size=self.config["rag"]["chunk_size"],
-                overlap=self.config["rag"]["overlap"],
-                top_k_title=self.config["rag"]["top_k_title"],
-                top_k_faiss=self.config["rag"]["top_k_faiss"],
-                top_k_final=self.config["rag"]["top_k_final"],
+                chunk_size=self.retrieval_config["chunk_size"],
+                overlap=self.retrieval_config["overlap"],
+                top_k_title=self.retrieval_config["top_k_title"],
+                top_k_faiss=self.retrieval_config["top_k_faiss"],
+                top_k_final=self.retrieval_config["top_k_final"],
                 usage_tracker=self.usage_tracker,
                 logger=self.logger
             )
@@ -414,22 +317,23 @@ class RAGSystem:
                 data_dir=self.data_dir,
                 inform_dir=self.inform_dir,
                 logger=self.logger,
-                model_url=self.config["llm"]["model_url"],
-                model_name=self.config["llm"]["model_name"],
-                max_tokens=self.config["llm"]["max_tokens"],
-                max_chars=self.config["llm"]["max_chars"],
-                temperature=self.config["llm"]["temperature"],
-                timeout=self.config["llm"]["timeout"],
-                history_lim=self.config["llm"]["history_limit"]
+                model_url=self.llm_config["url"],
+                model_name=self.llm_config["model_name"],
+                max_tokens=self.llm_config["max_tokens"],
+                max_chars=self.llm_config["max_chars"],
+                temperature=self.llm_config["temperature"],
+                timeout=self.llm_config["timeout"],
+                history_lim=self.llm_config["history_limit"],
+                system_msg=self.llm_config.get("system_message")
             )
 
             self.telegram = TelegramPublisher(
-                self.config["telegram"]["bot_token"],
-                self.config["telegram"]["channel_id"],
+                self.telegram_config["bot_token"],
+                self.telegram_config["channel_id"],
                 logger=self.logger,
-                max_retries=self.config["telegram"]["retry_attempts"],
-                retry_delay=self.config["telegram"]["retry_delay"],
-                enable_preview=self.config["telegram"]["enable_preview"]
+                max_retries=self.telegram_config["retry_attempts"],
+                retry_delay=self.telegram_config["retry_delay"],
+                enable_preview=self.telegram_config["enable_preview"]
             )
 
             # Проверка соединения с Telegram
@@ -437,7 +341,7 @@ class RAGSystem:
                 raise TelegramError("Failed to connect to Telegram")
 
             self.logger.info("System initialized successfully")
-            
+
             # Основной цикл обработки
             await self.process_topics()
 
@@ -453,18 +357,17 @@ class RAGSystem:
             # Сохранение статистики и очистка
             if hasattr(self, 'usage_tracker'):
                 self.usage_tracker.save_statistics()
-            
+
             # Вывод итоговой статистики
             stats = self.stats.to_dict()
             self.logger.info("Final statistics:")
             for key, value in stats.items():
                 self.logger.info(f"{key}: {value}")
-            
+
             self.logger.info("System shutdown complete")
 
 def main():
     """Точка входа с обработкой всех возможных ошибок"""
-    # Установка обработчика необработанных исключений
     def handle_exception(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
             sys.__excepthook__(exc_type, exc_value, exc_traceback)
@@ -473,10 +376,8 @@ def main():
             "Uncaught exception",
             exc_info=(exc_type, exc_value, exc_traceback)
         )
-
     sys.excepthook = handle_exception
-    
-    # Запуск системы
+
     rag_system = RAGSystem()
     try:
         asyncio.run(rag_system.run())

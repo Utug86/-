@@ -281,9 +281,9 @@ class RAGSystem:
         try:
             # --- Загрузка параметров из конфиг-менеджера ---
             self.telegram_config = self.config_manager.get_telegram_config()
-            self.llm_config = self.config_manager.config['language_model']
-            self.retrieval_config = self.config_manager.config['retrieval']
-            self.system_config = self.config_manager.config['system']
+            self.llm_config = self.config_manager.get_llm_config()
+            self.retrieval_config = self.config_manager.get_retrieval_config()
+            self.system_config = self.config_manager.get_system_config()
 
             # --- Инициализация компонентов ---
             self.setup_paths()
@@ -3401,6 +3401,15 @@ class ConfigManager:
     def get_telegram_config(self) -> Dict[str, Any]:
         """Получение конфигурации Telegram"""
         config = self.config['telegram'].copy()
+
+    def get_llm_config(self) -> Dict[str, Any]:
+        return self.config['language_model']
+
+    def get_retrieval_config(self) -> Dict[str, Any]:
+        return self.config['retrieval']
+
+    def get_system_config(self) -> Dict[str, Any]:
+        return self.config['system']
         
         # Загрузка токена и channel_id из файлов
         try:

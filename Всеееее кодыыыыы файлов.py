@@ -3385,6 +3385,7 @@ from pathlib import Path
 import json
 from typing import Any, Dict, Optional
 import logging
+from utils.exceptions import ConfigurationError
 
 class ConfigManager:
     def __init__(self, config_path: Path):
@@ -3400,18 +3401,46 @@ class ConfigManager:
                 return json.load(f)
         except Exception as e:
             self.logger.critical(f"Failed to load configuration: {e}")
-            raise
+            raise ConfigurationError(f"Failed to load configuration: {e}") from e
 
     def _validate_config(self):
         """Валидация конфигурации"""
         required_sections = ['telegram', 'language_model', 'retrieval', 'system', 'paths']
         for section in required_sections:
             if section not in self.config:
-                raise ValueError(f"Missing required config section: {section}")
+                raise ConfigurationError(f"Missing required config section: {section}")
 
     def get_telegram_config(self) -> Dict[str, Any]:
-        """Получение конфигурации Telegram"""
+        """
+        Получение конфигурации Telegram-бота (с безопасной загрузкой токена и channel_id из файлов).
+        :raises ConfigurationError: если не удаётся загрузить токен/ID или файлы отсутствуют.
+        """
         config = self.config['telegram'].copy()
+        try:
+            token_file = Path(config['bot_token_file'])
+            channel_file = Path(config['channel_id_file'])
+
+            if not token_file.is_file():
+                self.logger.critical(f"Telegram token file not found: {token_file}")
+                raise ConfigurationError(f"Telegram token file not found: {token_file}")
+            if not channel_file.is_file():
+                self.logger.critical(f"Channel ID file not found: {channel_file}")
+                raise ConfigurationError(f"Channel ID file not found: {channel_file}")
+
+            config['bot_token'] = token_file.read_text(encoding='utf-8').strip()
+            config['channel_id'] = channel_file.read_text(encoding='utf-8').strip()
+
+            if not config['bot_token']:
+                self.logger.critical("Telegram bot token is empty after reading file!")
+                raise ConfigurationError("Telegram bot token is empty!")
+            if not config['channel_id']:
+                self.logger.critical("Telegram channel_id is empty after reading file!")
+                raise ConfigurationError("Telegram channel_id is empty!")
+            return config
+
+        except Exception as e:
+            self.logger.critical(f"Failed to load Telegram credentials: {e}")
+            raise ConfigurationError(f"Failed to load Telegram credentials: {e}") from e
 
     def get_llm_config(self) -> Dict[str, Any]:
         return self.config['language_model']
@@ -3421,50 +3450,28 @@ class ConfigManager:
 
     def get_system_config(self) -> Dict[str, Any]:
         return self.config['system']
-        
-        # Загрузка токена и channel_id из файлов
-        try:
-            token_file = Path(config['bot_token_file'])
-            channel_file = Path(config['channel_id_file'])
-            
-            if not token_file.exists():
-                raise ValueError(f"Telegram token file not found: {token_file}")
-            if not channel_file.exists():
-                raise ValueError(f"Channel ID file not found: {channel_file}")
-            
-            config['bot_token'] = token_file.read_text(encoding='utf-8').strip()
-            config['channel_id'] = channel_file.read_text(encoding='utf-8').strip()
-            
-            return config
-        except Exception as e:
-            self.logger.critical(f"Failed to load Telegram credentials: {e}")
-            raise
 
     def get_path(self, path_key: str) -> Path:
-        """Получение пути из конфигурации"""
         if path_key not in self.config['paths']:
-            raise KeyError(f"Path not found in config: {path_key}")
+            raise ConfigurationError(f"Path not found in config: {path_key}")
         return Path(self.config['paths'][path_key])
 
     def get(self, section: str, key: str, default: Any = None) -> Any:
-        """Получение значения из конфигурации"""
         return self.config.get(section, {}).get(key, default)
 
     def update(self, section: str, key: str, value: Any):
-        """Обновление значения в конфигурации"""
         if section not in self.config:
             self.config[section] = {}
         self.config[section][key] = value
         self._save_config()
 
     def _save_config(self):
-        """Сохранение конфигурации в файл"""
         try:
             with open(self.config_path, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=4, ensure_ascii=False)
         except Exception as e:
             self.logger.error(f"Failed to save configuration: {e}")
-            raise
+            raise ConfigurationError(f"Failed to save configuration: {e}") from e
 
 # код -  utils/exceptions.py
 class RAGException(Exception):
